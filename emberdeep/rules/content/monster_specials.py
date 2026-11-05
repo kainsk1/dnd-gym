@@ -305,19 +305,20 @@ class DivineEminence(SpecialAction):
 # ----------------------------------------------------------------------------- engulf (gelatinous cube)
 @register_special_action("engulf")
 class Engulf(SpecialAction):
-    """Action: every hostile creature of the allowed size adjacent to the cube makes a DEX save; on a failure it is engulfed
-    (3d6 acid, grappled + restrained, 6d6 acid at the start of each round, STR check to escape) and moves with the cube; on a
-    success it is pushed 5 ft away.  The cube holds one Large creature or up to four Medium or smaller ones.  (The cube
-    cannot yet enter occupied squares, so it engulfs what is next to it: see the contract request.)"""
+    """Action: the cube moves up to its speed and may enter the spaces of Large-or-smaller creatures; whenever it enters a
+    creature's space that creature makes a DEX save.  On a failure it is engulfed (3d6 acid, grappled + restrained, 6d6 acid
+    at the start of each of its turns, STR check to escape) and moves with the cube; on a success it is pushed 5 ft away.
+    The cube holds one Large creature or up to four Medium or smaller ones.  The movement is extra movement of the action
+    (it does not use the turn's movement) and uses the engine's shared squares (``ooze_cube.may_share_space``)."""
 
-    def _targets(self, world, actor, sdef):
-        lim = U.SIZE_BY_NAME.get(str(sdef.params.get("size_limit", "large")), Size.LARGE)
-        out = []
-        for o in U.hostiles(world, actor, visible=False, maxd=1):
-            if o.present and int(o.size) <= int(lim) and not any(
-                    ci.source == actor.eid for ci in o.conditions.get(int(Condition.RESTRAINED), ())):
-                out.append(o)
-        return out
+    def _limit(self, sdef) -> int:
+        return int(U.SIZE_BY_NAME.get(str(sdef.params.get("size_limit", "large")), Size.LARGE))
+
+    def _eligible(self, world, actor, sdef):
+        lim = self._limit(sdef)
+        return [o for o in U.hostiles(world, actor, visible=False)
+                if o.present and int(o.size) <= lim and o.z == actor.z and not any(
+                    ci.source == actor.eid for ci in o.conditions.get(int(Condition.RESTRAINED), ()))]
 
     def _room(self, world, actor):
         held = [world.entities[g] for g in actor.grappling if world.entities[g].present]
@@ -325,33 +326,82 @@ class Engulf(SpecialAction):
         return not big and len(held) < 4
 
     def usable(self, world, actor, sdef):
-        return bool(self._targets(world, actor, sdef)) and self._room(world, actor)
+        if not self._room(world, actor):
+            return False
+        reach = R.base_speed(world, actor) // 5 + actor.size_sq
+        return any(world.distance(actor.eid, o.eid) <= reach for o in self._eligible(world, actor, sdef))
 
-    def execute(self, world, actor, sdef, eid, point):
+    def _overlaps(self, actor, o) -> bool:
+        mine = set(actor.cells())
+        return any(p in mine for p in o.cells())
+
+    def _engulf_one(self, world, actor, sdef, t) -> None:
         dc = int(sdef.params.get("dc", 12))
         esc = int(sdef.params.get("escape_dc", 12))
         ab = U.ability_of(sdef.params.get("ability", "dex"))
-        for t in self._targets(world, actor, sdef):
-            if not self._room(world, actor):
-                break
-            R.check_betrayal(world, actor, t)
-            world.notice_attack(actor, t)
-            if R.saving_throw(world, t, ab, dc, actor.eid, name="engulf"):
-                dx = (t.x > actor.x) - (t.x < actor.x)
-                dy = (t.y > actor.y) - (t.y < actor.y)
-                if dx or dy:
-                    world.forced_move(t, dx, dy, 1, actor.eid)
-                continue
-            dice, dt = U.parse_dmg(str(sdef.params.get("damage_enter", "3d6 acid")), DamageType.ACID)
-            U.deal(world, actor, t, dice, dt, "engulf")
-            if not t.present:
-                continue
-            R.add_condition(world, t, Condition.GRAPPLED, actor.eid, -1, escape_dc=esc)
-            R.add_condition(world, t, Condition.RESTRAINED, actor.eid, -1, escape_dc=esc)
-            if t.eid not in actor.grappling:
-                actor.grappling.append(t.eid)
-            EF.add_effect(world, actor, t, "engulfed", -1, {"damage_start_of_turn": sdef.params.get("damage_turn", "6d6 acid"),
-                                                            "cannot_breathe": True}, silent=False)
+        R.check_betrayal(world, actor, t)
+        world.notice_attack(actor, t)
+        if R.saving_throw(world, t, ab, dc, actor.eid, name="engulf"):
+            # pushed 5 ft out of the cube's space
+            dx = (t.x + t.size_sq / 2.0 > actor.x + actor.size_sq / 2.0) - (t.x + t.size_sq / 2.0 < actor.x + actor.size_sq / 2.0)
+            dy = (t.y + t.size_sq / 2.0 > actor.y + actor.size_sq / 2.0) - (t.y + t.size_sq / 2.0 < actor.y + actor.size_sq / 2.0)
+            if not (dx or dy):
+                dx = 1
+            world.forced_move(t, dx, dy, 1, actor.eid)
+            return
+        dice, dt = U.parse_dmg(str(sdef.params.get("damage_enter", "3d6 acid")), DamageType.ACID)
+        U.deal(world, actor, t, dice, dt, "engulf")
+        if not t.present:
+            return
+        R.add_condition(world, t, Condition.GRAPPLED, actor.eid, -1, escape_dc=esc)
+        R.add_condition(world, t, Condition.RESTRAINED, actor.eid, -1, escape_dc=esc)
+        if t.eid not in actor.grappling:
+            actor.grappling.append(t.eid)
+        EF.add_effect(world, actor, t, "engulfed", -1, {"damage_start_of_turn": sdef.params.get("damage_turn", "6d6 acid"),
+                                                        "cannot_breathe": True}, silent=False)
+
+    def execute(self, world, actor, sdef, eid, point):
+        hook = R.find_hook(actor, "ooze_cube")
+        if hook is not None:
+            hook.state["engulfing"] = True
+        ts = actor.ts
+        saved = ts.movement_left
+        feet = R.base_speed(world, actor)
+        ts.movement_left = feet
+        done: set = set()
+        try:
+            for _ in range(feet // 5 + 2):
+                if not self._room(world, actor):
+                    break
+                # creatures already sharing the cube's space
+                hit = False
+                for o in self._eligible(world, actor, sdef):
+                    if o.eid not in done and self._overlaps(actor, o) and self._room(world, actor):
+                        done.add(o.eid)
+                        self._engulf_one(world, actor, sdef, o)
+                        hit = True
+                if hit:
+                    continue
+                cand = [o for o in self._eligible(world, actor, sdef) if o.eid not in done]
+                if not cand or ts.movement_left < 5:
+                    break
+                cand.sort(key=lambda o: (world.distance(actor.eid, o.eid), o.eid))
+                tgt = cand[0]
+                dx = (tgt.x > actor.x) - (tgt.x < actor.x)
+                dy = (tgt.y > actor.y) - (tgt.y < actor.y)
+                if tgt.size_sq > 1:                     # aim at the nearest of the target's squares
+                    dx = (tgt.x + tgt.size_sq - 1 > actor.x + actor.size_sq - 1) - (tgt.x < actor.x)
+                    dy = (tgt.y + tgt.size_sq - 1 > actor.y + actor.size_sq - 1) - (tgt.y < actor.y)
+                if not world.try_step(actor, dx, dy):
+                    # a diagonal blocked by corners: try the axes
+                    if not ((dx and world.try_step(actor, dx, 0)) or (dy and world.try_step(actor, 0, dy))):
+                        break
+                if not actor.present or actor.status & S.DEAD:
+                    break
+        finally:
+            if hook is not None:
+                hook.state["engulfing"] = False
+            ts.movement_left = saved
 
 
 # ----------------------------------------------------------------------------- ethereal plane

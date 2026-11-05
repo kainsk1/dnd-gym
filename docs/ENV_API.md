@@ -276,7 +276,7 @@ These tables are generated from the code (`python -m emberdeep.env.docgen --writ
 #### `self`
 
 <!-- BEGIN GENERATED:self_features -->
-`self` has **124** features.
+`self` has **129** features.
 
 | idx | name | description |
 |---|---|---|
@@ -327,89 +327,94 @@ These tables are generated from the code (`python -m emberdeep.env.docgen --writ
 | 44 | `status.flying` | status flag flying set |
 | 45 | `status.escaped` | status flag escaped set |
 | 46 | `status.summoned` | status flag summoned set |
-| 47 | `exhaustion` | exhaustion level / 6 |
-| 48 | `concentrating` | concentrating on a spell |
-| 49 | `death_save_successes` | death-save successes / 3 |
-| 50 | `death_save_failures` | death-save failures / 3 |
-| 51 | `slots.1` | spell slots of level 1 remaining / 4 (clipped at 2) |
-| 52 | `slots.2` | spell slots of level 2 remaining / 4 (clipped at 2) |
-| 53 | `slots.3` | spell slots of level 3 remaining / 4 (clipped at 2) |
-| 54 | `slots.4` | spell slots of level 4 remaining / 4 (clipped at 2) |
-| 55 | `slots.5` | spell slots of level 5 remaining / 4 (clipped at 2) |
-| 56 | `slots.6` | spell slots of level 6 remaining / 4 (clipped at 2) |
-| 57 | `slots.7` | spell slots of level 7 remaining / 4 (clipped at 2) |
-| 58 | `slots.8` | spell slots of level 8 remaining / 4 (clipped at 2) |
-| 59 | `slots.9` | spell slots of level 9 remaining / 4 (clipped at 2) |
-| 60 | `pact_slots` | warlock pact slots remaining / 4 |
-| 61 | `pact_level` | warlock pact slot level / 5 |
-| 62 | `res.action_surge` | class resource action_surge: fraction remaining, -1 if the creature does not have it |
-| 63 | `res.arcane_recovery` | class resource arcane_recovery: fraction remaining, -1 if the creature does not have it |
-| 64 | `res.bardic_inspiration` | class resource bardic_inspiration: fraction remaining, -1 if the creature does not have it |
-| 65 | `res.channel_divinity` | class resource channel_divinity: fraction remaining, -1 if the creature does not have it |
-| 66 | `res.divine_sense` | class resource divine_sense: fraction remaining, -1 if the creature does not have it |
-| 67 | `res.ki` | class resource ki: fraction remaining, -1 if the creature does not have it |
-| 68 | `res.lay_on_hands` | class resource lay_on_hands: fraction remaining, -1 if the creature does not have it |
-| 69 | `res.rage` | class resource rage: fraction remaining, -1 if the creature does not have it |
-| 70 | `res.second_wind` | class resource second_wind: fraction remaining, -1 if the creature does not have it |
-| 71 | `res.sorcery_points` | class resource sorcery_points: fraction remaining, -1 if the creature does not have it |
-| 72 | `res.wild_shape` | class resource wild_shape: fraction remaining, -1 if the creature does not have it |
-| 73 | `res.other` | class resource other: fraction remaining, -1 if the creature does not have it |
-| 74 | `gold` | log(1 + gold) / log(1 + 2000) |
-| 75 | `potions` | healing potions carried / 3 |
-| 76 | `class.barbarian` | player class barbarian (one-hot) |
-| 77 | `class.bard` | player class bard (one-hot) |
-| 78 | `class.cleric` | player class cleric (one-hot) |
-| 79 | `class.druid` | player class druid (one-hot) |
-| 80 | `class.fighter` | player class fighter (one-hot) |
-| 81 | `class.monk` | player class monk (one-hot) |
-| 82 | `class.paladin` | player class paladin (one-hot) |
-| 83 | `class.ranger` | player class ranger (one-hot) |
-| 84 | `class.rogue` | player class rogue (one-hot) |
-| 85 | `class.sorcerer` | player class sorcerer (one-hot) |
-| 86 | `class.warlock` | player class warlock (one-hot) |
-| 87 | `class.wizard` | player class wizard (one-hot) |
-| 88 | `is_monster` | 1 if the controlled creature is a monster (not a player class) |
-| 89 | `level` | character level or CR / 10 |
-| 90 | `mod.str` | ability modifier str / 5 |
-| 91 | `mod.dex` | ability modifier dex / 5 |
-| 92 | `mod.con` | ability modifier con / 5 |
-| 93 | `mod.int` | ability modifier int / 5 |
-| 94 | `mod.wis` | ability modifier wis / 5 |
-| 95 | `mod.cha` | ability modifier cha / 5 |
-| 96 | `mode_combat` | 1 in combat, 0 in exploration |
-| 97 | `round` | round / max rounds |
-| 98 | `is_decider` | 1 if this agent must act now |
-| 99 | `decision.none` | pending decision kind none (one-hot, 'none' when no decision) |
-| 100 | `decision.opportunity_attack` | pending decision kind opportunity_attack (one-hot, 'none' when no decision) |
-| 101 | `decision.readied_trigger` | pending decision kind readied_trigger (one-hot, 'none' when no decision) |
-| 102 | `decision.on_attacked` | pending decision kind on_attacked (one-hot, 'none' when no decision) |
-| 103 | `decision.on_damaged` | pending decision kind on_damaged (one-hot, 'none' when no decision) |
-| 104 | `decision.on_spell_cast` | pending decision kind on_spell_cast (one-hot, 'none' when no decision) |
-| 105 | `decision.on_hit_rider` | pending decision kind on_hit_rider (one-hot, 'none' when no decision) |
-| 106 | `decision.ally_attacked` | pending decision kind ally_attacked (one-hot, 'none' when no decision) |
-| 107 | `decision.truce_offer` | pending decision kind truce_offer (one-hot, 'none' when no decision) |
-| 108 | `decision.legendary` | pending decision kind legendary (one-hot, 'none' when no decision) |
-| 109 | `decision.spell_choice` | pending decision kind spell_choice (one-hot, 'none' when no decision) |
-| 110 | `decision.on_fall` | pending decision kind on_fall (one-hot, 'none' when no decision) |
-| 111 | `rest_vote_self` | this agent has voted to rest |
-| 112 | `rest_vote_frac` | fraction of faction members who voted to rest |
-| 113 | `faction.0` | faction index 0 (one-hot) |
-| 114 | `faction.1` | faction index 1 (one-hot) |
-| 115 | `faction.2` | faction index 2 (one-hot) |
-| 116 | `faction.3` | faction index 3 (one-hot) |
-| 117 | `faction.4` | faction index 4 (one-hot) |
-| 118 | `faction.5` | faction index 5 (one-hot) |
-| 119 | `faction.6` | faction index 6 (one-hot) |
-| 120 | `faction.7` | faction index 7 (one-hot) |
-| 121 | `truce_offer_incoming` | another faction offered a truce to this agent's faction |
-| 122 | `truce_offer_outgoing` | this agent's faction has an open truce offer |
-| 123 | `agent_index` | (agent index + 1) / number of agents |
+| 47 | `status.mounted` | status flag mounted set |
+| 48 | `status.carrying_rider` | status flag carrying_rider set |
+| 49 | `status.squeezing` | status flag squeezing set |
+| 50 | `status.burrowed` | status flag burrowed set |
+| 51 | `exhaustion` | exhaustion level / 6 |
+| 52 | `concentrating` | concentrating on a spell |
+| 53 | `death_save_successes` | death-save successes / 3 |
+| 54 | `death_save_failures` | death-save failures / 3 |
+| 55 | `slots.1` | spell slots of level 1 remaining / 4 (clipped at 2) |
+| 56 | `slots.2` | spell slots of level 2 remaining / 4 (clipped at 2) |
+| 57 | `slots.3` | spell slots of level 3 remaining / 4 (clipped at 2) |
+| 58 | `slots.4` | spell slots of level 4 remaining / 4 (clipped at 2) |
+| 59 | `slots.5` | spell slots of level 5 remaining / 4 (clipped at 2) |
+| 60 | `slots.6` | spell slots of level 6 remaining / 4 (clipped at 2) |
+| 61 | `slots.7` | spell slots of level 7 remaining / 4 (clipped at 2) |
+| 62 | `slots.8` | spell slots of level 8 remaining / 4 (clipped at 2) |
+| 63 | `slots.9` | spell slots of level 9 remaining / 4 (clipped at 2) |
+| 64 | `pact_slots` | warlock pact slots remaining / 4 |
+| 65 | `pact_level` | warlock pact slot level / 5 |
+| 66 | `res.action_surge` | class resource action_surge: fraction remaining, -1 if the creature does not have it |
+| 67 | `res.arcane_recovery` | class resource arcane_recovery: fraction remaining, -1 if the creature does not have it |
+| 68 | `res.bardic_inspiration` | class resource bardic_inspiration: fraction remaining, -1 if the creature does not have it |
+| 69 | `res.channel_divinity` | class resource channel_divinity: fraction remaining, -1 if the creature does not have it |
+| 70 | `res.divine_sense` | class resource divine_sense: fraction remaining, -1 if the creature does not have it |
+| 71 | `res.ki` | class resource ki: fraction remaining, -1 if the creature does not have it |
+| 72 | `res.lay_on_hands` | class resource lay_on_hands: fraction remaining, -1 if the creature does not have it |
+| 73 | `res.rage` | class resource rage: fraction remaining, -1 if the creature does not have it |
+| 74 | `res.second_wind` | class resource second_wind: fraction remaining, -1 if the creature does not have it |
+| 75 | `res.sorcery_points` | class resource sorcery_points: fraction remaining, -1 if the creature does not have it |
+| 76 | `res.wild_shape` | class resource wild_shape: fraction remaining, -1 if the creature does not have it |
+| 77 | `res.other` | class resource other: fraction remaining, -1 if the creature does not have it |
+| 78 | `gold` | log(1 + gold) / log(1 + 2000) |
+| 79 | `potions` | healing potions carried / 3 |
+| 80 | `class.barbarian` | player class barbarian (one-hot) |
+| 81 | `class.bard` | player class bard (one-hot) |
+| 82 | `class.cleric` | player class cleric (one-hot) |
+| 83 | `class.druid` | player class druid (one-hot) |
+| 84 | `class.fighter` | player class fighter (one-hot) |
+| 85 | `class.monk` | player class monk (one-hot) |
+| 86 | `class.paladin` | player class paladin (one-hot) |
+| 87 | `class.ranger` | player class ranger (one-hot) |
+| 88 | `class.rogue` | player class rogue (one-hot) |
+| 89 | `class.sorcerer` | player class sorcerer (one-hot) |
+| 90 | `class.warlock` | player class warlock (one-hot) |
+| 91 | `class.wizard` | player class wizard (one-hot) |
+| 92 | `is_monster` | 1 if the controlled creature is a monster (not a player class) |
+| 93 | `level` | character level or CR / 10 |
+| 94 | `mod.str` | ability modifier str / 5 |
+| 95 | `mod.dex` | ability modifier dex / 5 |
+| 96 | `mod.con` | ability modifier con / 5 |
+| 97 | `mod.int` | ability modifier int / 5 |
+| 98 | `mod.wis` | ability modifier wis / 5 |
+| 99 | `mod.cha` | ability modifier cha / 5 |
+| 100 | `mode_combat` | 1 in combat, 0 in exploration |
+| 101 | `round` | round / max rounds |
+| 102 | `is_decider` | 1 if this agent must act now |
+| 103 | `decision.none` | pending decision kind none (one-hot, 'none' when no decision) |
+| 104 | `decision.opportunity_attack` | pending decision kind opportunity_attack (one-hot, 'none' when no decision) |
+| 105 | `decision.readied_trigger` | pending decision kind readied_trigger (one-hot, 'none' when no decision) |
+| 106 | `decision.on_attacked` | pending decision kind on_attacked (one-hot, 'none' when no decision) |
+| 107 | `decision.on_damaged` | pending decision kind on_damaged (one-hot, 'none' when no decision) |
+| 108 | `decision.on_spell_cast` | pending decision kind on_spell_cast (one-hot, 'none' when no decision) |
+| 109 | `decision.on_hit_rider` | pending decision kind on_hit_rider (one-hot, 'none' when no decision) |
+| 110 | `decision.ally_attacked` | pending decision kind ally_attacked (one-hot, 'none' when no decision) |
+| 111 | `decision.truce_offer` | pending decision kind truce_offer (one-hot, 'none' when no decision) |
+| 112 | `decision.legendary` | pending decision kind legendary (one-hot, 'none' when no decision) |
+| 113 | `decision.spell_choice` | pending decision kind spell_choice (one-hot, 'none' when no decision) |
+| 114 | `decision.on_fall` | pending decision kind on_fall (one-hot, 'none' when no decision) |
+| 115 | `decision.post_roll` | pending decision kind post_roll (one-hot, 'none' when no decision) |
+| 116 | `rest_vote_self` | this agent has voted to rest |
+| 117 | `rest_vote_frac` | fraction of faction members who voted to rest |
+| 118 | `faction.0` | faction index 0 (one-hot) |
+| 119 | `faction.1` | faction index 1 (one-hot) |
+| 120 | `faction.2` | faction index 2 (one-hot) |
+| 121 | `faction.3` | faction index 3 (one-hot) |
+| 122 | `faction.4` | faction index 4 (one-hot) |
+| 123 | `faction.5` | faction index 5 (one-hot) |
+| 124 | `faction.6` | faction index 6 (one-hot) |
+| 125 | `faction.7` | faction index 7 (one-hot) |
+| 126 | `truce_offer_incoming` | another faction offered a truce to this agent's faction |
+| 127 | `truce_offer_outgoing` | this agent's faction has an open truce offer |
+| 128 | `agent_index` | (agent index + 1) / number of agents |
 <!-- END GENERATED:self_features -->
 
 #### `entities`
 
 <!-- BEGIN GENERATED:entity_features -->
-`entities[slot, :]` has **113** features with the default `comm_vocab=8` (105 without the `said.*` block; the block grows with `comm_vocab`).
+`entities[slot, :]` has **117** features with the default `comm_vocab=8` (109 without the `said.*` block; the block grows with `comm_vocab`).
 
 | idx | name | description |
 |---|---|---|
@@ -454,78 +459,82 @@ These tables are generated from the code (`python -m emberdeep.env.docgen --writ
 | 38 | `status.flying` | status flag flying (hidden bit is masked for non-allies) |
 | 39 | `status.escaped` | status flag escaped (hidden bit is masked for non-allies) |
 | 40 | `status.summoned` | status flag summoned (hidden bit is masked for non-allies) |
-| 41 | `size` | size category / 5 |
-| 42 | `ctype.aberration` | creature type aberration |
-| 43 | `ctype.beast` | creature type beast |
-| 44 | `ctype.celestial` | creature type celestial |
-| 45 | `ctype.construct` | creature type construct |
-| 46 | `ctype.dragon` | creature type dragon |
-| 47 | `ctype.elemental` | creature type elemental |
-| 48 | `ctype.fey` | creature type fey |
-| 49 | `ctype.fiend` | creature type fiend |
-| 50 | `ctype.giant` | creature type giant |
-| 51 | `ctype.humanoid` | creature type humanoid |
-| 52 | `ctype.monstrosity` | creature type monstrosity |
-| 53 | `ctype.ooze` | creature type ooze |
-| 54 | `ctype.plant` | creature type plant |
-| 55 | `ctype.undead` | creature type undead |
-| 56 | `level` | character level or CR / 10 |
-| 57 | `is_agent` | controlled through the RL API |
-| 58 | `agent_index` | (agent index + 1) / number of agents (0 if scripted) |
-| 59 | `is_active` | its turn is in progress |
-| 60 | `initiative` | position in the turn order / length (-1 outside combat) |
-| 61 | `concentrating` | concentrating on a spell |
-| 62 | `downed` | at 0 HP (dying or stable) |
-| 63 | `surrendered` | has surrendered |
-| 64 | `fleeing` | is fleeing |
-| 65 | `faction.0` | faction index 0 (one-hot) |
-| 66 | `faction.1` | faction index 1 (one-hot) |
-| 67 | `faction.2` | faction index 2 (one-hot) |
-| 68 | `faction.3` | faction index 3 (one-hot) |
-| 69 | `faction.4` | faction index 4 (one-hot) |
-| 70 | `faction.5` | faction index 5 (one-hot) |
-| 71 | `faction.6` | faction index 6 (one-hot) |
-| 72 | `faction.7` | faction index 7 (one-hot) |
-| 73 | `rel.self` | relation to the observer: self |
-| 74 | `rel.ally` | relation to the observer: ally |
-| 75 | `rel.neutral` | relation to the observer: neutral |
-| 76 | `rel.truce` | relation to the observer: truce |
-| 77 | `rel.hostile` | relation to the observer: hostile |
-| 78 | `dx` | x offset to the observer / 20 (clipped) |
-| 79 | `dy` | y offset to the observer / 20 (clipped) |
-| 80 | `dz` | altitude offset / 6 |
-| 81 | `dist` | edge-to-edge distance in squares / 20 (clipped at 2) |
-| 82 | `in_reach` | within the observer's melee reach |
-| 83 | `in_range` | within range of the observer's longest-range attack ability |
-| 84 | `has_los` | the observer sees this entity (line of sight, light, stealth) |
-| 85 | `cover` | cover from the observer / 3 (0 none .. 1 total) |
-| 86 | `hp_frac` | HP fraction (allies exact; others per `enemy_hp`: bucket / exact / hidden=0) |
-| 87 | `hp_known` | 1 if HP information is exposed for this entity |
-| 88 | `hp_abs` | HP / 100 (allies and `enemy_hp='exact'` only) |
-| 89 | `ac` | armour class / 30 (allies; others once the observer's faction has attacked them), else 0 |
-| 90 | `ac_known` | 1 if `ac` is valid |
-| 91 | `truce_offer_in` | its faction offered a truce to the observer's faction |
-| 92 | `truce_offer_out` | observer's faction offered a truce to its faction |
-| 93 | `said.0` | last SAY token 0 (one-hot, decays with age) |
-| 94 | `said.1` | last SAY token 1 (one-hot, decays with age) |
-| 95 | `said.2` | last SAY token 2 (one-hot, decays with age) |
-| 96 | `said.3` | last SAY token 3 (one-hot, decays with age) |
-| 97 | `said.4` | last SAY token 4 (one-hot, decays with age) |
-| 98 | `said.5` | last SAY token 5 (one-hot, decays with age) |
-| 99 | `said.6` | last SAY token 6 (one-hot, decays with age) |
-| 100 | `said.7` | last SAY token 7 (one-hot, decays with age) |
-| 101 | `dmg_to_me` | social: damage it dealt to the observer / 50 (needs social_features) |
-| 102 | `dmg_to_allies` | social: damage it dealt to the observer's allies / 50 |
-| 103 | `heal_to_me` | social: healing it gave the observer / 50 |
-| 104 | `heal_to_allies` | social: healing it gave the observer's allies / 50 |
-| 105 | `gold_to_me` | social: gold it gave the observer / 100 |
-| 106 | `betrayals` | social: betrayals (attacks on allies / truce partners) by it against the observer's faction / 3 |
-| 107 | `obj_open` | object: door open / chest opened / lever on |
-| 108 | `obj_closed` | object: door or chest closed |
-| 109 | `obj_locked` | object: locked |
-| 110 | `obj_broken` | object: door broken / trap disarmed or triggered |
-| 111 | `obj_value` | object: log(1 + gold value) / log(1 + 1000) of loot or chest contents |
-| 112 | `obj_charges` | object: altar charges / capacity |
+| 41 | `status.mounted` | status flag mounted (hidden bit is masked for non-allies) |
+| 42 | `status.carrying_rider` | status flag carrying_rider (hidden bit is masked for non-allies) |
+| 43 | `status.squeezing` | status flag squeezing (hidden bit is masked for non-allies) |
+| 44 | `status.burrowed` | status flag burrowed (hidden bit is masked for non-allies) |
+| 45 | `size` | size category / 5 |
+| 46 | `ctype.aberration` | creature type aberration |
+| 47 | `ctype.beast` | creature type beast |
+| 48 | `ctype.celestial` | creature type celestial |
+| 49 | `ctype.construct` | creature type construct |
+| 50 | `ctype.dragon` | creature type dragon |
+| 51 | `ctype.elemental` | creature type elemental |
+| 52 | `ctype.fey` | creature type fey |
+| 53 | `ctype.fiend` | creature type fiend |
+| 54 | `ctype.giant` | creature type giant |
+| 55 | `ctype.humanoid` | creature type humanoid |
+| 56 | `ctype.monstrosity` | creature type monstrosity |
+| 57 | `ctype.ooze` | creature type ooze |
+| 58 | `ctype.plant` | creature type plant |
+| 59 | `ctype.undead` | creature type undead |
+| 60 | `level` | character level or CR / 10 |
+| 61 | `is_agent` | controlled through the RL API |
+| 62 | `agent_index` | (agent index + 1) / number of agents (0 if scripted) |
+| 63 | `is_active` | its turn is in progress |
+| 64 | `initiative` | position in the turn order / length (-1 outside combat) |
+| 65 | `concentrating` | concentrating on a spell |
+| 66 | `downed` | at 0 HP (dying or stable) |
+| 67 | `surrendered` | has surrendered |
+| 68 | `fleeing` | is fleeing |
+| 69 | `faction.0` | faction index 0 (one-hot) |
+| 70 | `faction.1` | faction index 1 (one-hot) |
+| 71 | `faction.2` | faction index 2 (one-hot) |
+| 72 | `faction.3` | faction index 3 (one-hot) |
+| 73 | `faction.4` | faction index 4 (one-hot) |
+| 74 | `faction.5` | faction index 5 (one-hot) |
+| 75 | `faction.6` | faction index 6 (one-hot) |
+| 76 | `faction.7` | faction index 7 (one-hot) |
+| 77 | `rel.self` | relation to the observer: self |
+| 78 | `rel.ally` | relation to the observer: ally |
+| 79 | `rel.neutral` | relation to the observer: neutral |
+| 80 | `rel.truce` | relation to the observer: truce |
+| 81 | `rel.hostile` | relation to the observer: hostile |
+| 82 | `dx` | x offset to the observer / 20 (clipped) |
+| 83 | `dy` | y offset to the observer / 20 (clipped) |
+| 84 | `dz` | altitude offset / 6 |
+| 85 | `dist` | edge-to-edge distance in squares / 20 (clipped at 2) |
+| 86 | `in_reach` | within the observer's melee reach |
+| 87 | `in_range` | within range of the observer's longest-range attack ability |
+| 88 | `has_los` | the observer sees this entity (line of sight, light, stealth) |
+| 89 | `cover` | cover from the observer / 3 (0 none .. 1 total) |
+| 90 | `hp_frac` | HP fraction (allies exact; others per `enemy_hp`: bucket / exact / hidden=0) |
+| 91 | `hp_known` | 1 if HP information is exposed for this entity |
+| 92 | `hp_abs` | HP / 100 (allies and `enemy_hp='exact'` only) |
+| 93 | `ac` | armour class / 30 (allies; others once the observer's faction has attacked them), else 0 |
+| 94 | `ac_known` | 1 if `ac` is valid |
+| 95 | `truce_offer_in` | its faction offered a truce to the observer's faction |
+| 96 | `truce_offer_out` | observer's faction offered a truce to its faction |
+| 97 | `said.0` | last SAY token 0 (one-hot, decays with age) |
+| 98 | `said.1` | last SAY token 1 (one-hot, decays with age) |
+| 99 | `said.2` | last SAY token 2 (one-hot, decays with age) |
+| 100 | `said.3` | last SAY token 3 (one-hot, decays with age) |
+| 101 | `said.4` | last SAY token 4 (one-hot, decays with age) |
+| 102 | `said.5` | last SAY token 5 (one-hot, decays with age) |
+| 103 | `said.6` | last SAY token 6 (one-hot, decays with age) |
+| 104 | `said.7` | last SAY token 7 (one-hot, decays with age) |
+| 105 | `dmg_to_me` | social: damage it dealt to the observer / 50 (needs social_features) |
+| 106 | `dmg_to_allies` | social: damage it dealt to the observer's allies / 50 |
+| 107 | `heal_to_me` | social: healing it gave the observer / 50 |
+| 108 | `heal_to_allies` | social: healing it gave the observer's allies / 50 |
+| 109 | `gold_to_me` | social: gold it gave the observer / 100 |
+| 110 | `betrayals` | social: betrayals (attacks on allies / truce partners) by it against the observer's faction / 3 |
+| 111 | `obj_open` | object: door open / chest opened / lever on |
+| 112 | `obj_closed` | object: door or chest closed |
+| 113 | `obj_locked` | object: locked |
+| 114 | `obj_broken` | object: door broken / trap disarmed or triggered |
+| 115 | `obj_value` | object: log(1 + gold value) / log(1 + 1000) of loot or chest contents |
+| 116 | `obj_charges` | object: altar charges / capacity |
 <!-- END GENERATED:entity_features -->
 
 #### `abilities`
@@ -902,20 +911,27 @@ observation (+ masks) for the next agent included, Python 3.13 (`python -m ember
 
 | benchmark | agent steps / s |
 |---|---|
-| AEC (one core) | ~630 |
-| Parallel (fresh obs for 4 agents each step) | ~350 |
-| Parallel, `waiting_obs="stale"` | ~660 |
-| 4 sub-environments in-process (`SyncVectorEnv`), full / stale | ~320 / ~570 |
-| 4 worker processes (`AsyncVectorEnv`), full / stale | ~570 / ~800 |
+| AEC (one core) | ~1,000 |
+| Parallel (fresh obs for 4 agents each step) | ~700 |
+| Parallel, `waiting_obs="stale"` | ~1,000 |
+| 4 sub-environments in-process (`SyncVectorEnv`), full / stale | ~610 / ~900 |
+| 4 worker processes (`AsyncVectorEnv`), full / stale | ~960 / ~1,300 |
 
-Where the time goes (AEC, per agent step, about 1.6 ms): observation + masks 1.07 ms (candidate slots and
-legality masks 0.6 ms, entity features 0.13 ms via a Numba kernel, map 0.12 ms), the agent's engine step and the
-scripted monsters' turns 0.45 ms, bookkeeping 0.1 ms. The approach mask uses one Dijkstra field plus a batched kernel
-per decision, candidate sight is evaluated by a batched kernel; `tests/test_perf_*.py` check these against the
-reference implementations bit for bit. The DESIGN target of 1,500 agent steps/s per core is **not**
-reached on this hardware; the floor set by the engine's `ability_mask` / `target_mask` / `visible_cells` and the
-scripted AI is about 0.5 ms per step, see `docs/dev/contract_requests/env.md` for the engine-side optimisations that
-would help most. Practical advice:
+(Before perf2: AEC ~790, Parallel ~580, async-vec ~780 on the same box.)
+
+Where the time goes (AEC, per agent step, about 1.0 ms): observation 0.17 ms, legality masks and slots 0.38 ms
+(approach mask 0.10 ms -- one Dijkstra field per decision, the largest single item; target masks 0.07 ms, ability
+mask 0.05 ms, candidate slots 0.05 ms, move mask 0.02 ms), the agent's engine step 0.17 ms and the scripted monsters'
+AI 0.10 ms, bookkeeping the rest.  perf2 made the masks cheaper by economy-gating `usable()` (spent action / bonus /
+movement classes are skipped), distance / kind / relation pre-filters for `valid_target`, a memoised, Numba-backed
+`move_mask`, a Numba field-of-view window and point-slot kernels, and scalar `_step_cost` for size-1 walkers; the
+reference implementations (`ability_mask_ref`, `target_mask_ref`, `move_mask_ref`, `visible_cells_ref`,
+`point_slots_ref_into`) stay in the code and `tests/test_perf2_masks.py` / `tests/test_perf_*.py` check the fast
+paths against them bit for bit on every scenario.  `World.estimate` / `estimate_many` never consume `world.rng`
+(random defences such as Sanctuary and Mirror Image contribute expected values).  `python benchmarks/bench_perf2.py
+--profile` prints the throughput and a cProfile summary.  The DESIGN target of 1,500 agent steps/s per core is **not**
+reached on this hardware (the engine/AI turns and the approach Dijkstra are the floor); async vector envs with
+`waiting_obs="stale"` do exceed it.  Practical advice:
 
 * use `waiting_obs="stale"` for Parallel / vector training when only the acting agent's observation matters;
 * shrink what you do not need: `max_entities`, `view_radius`, `n_point_targets`, `obs_dtype="float16"`,

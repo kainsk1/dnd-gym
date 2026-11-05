@@ -496,6 +496,7 @@ class Renderer:
             if not ve.moving:
                 ve.x, ve.y = float(e.x), float(e.y)
             ve.z = float(e.z)
+            ve.mounted_on = getattr(e, "mounted_on", -1)
             ve.conditions = set(e.conditions)
             ve.effects = set(e.effects)
             ve.statuses = set(e.statuses)
@@ -1137,7 +1138,13 @@ class Renderer:
         # --- HUD ---------------------------------------------------------------------------------------
         t4 = time.perf_counter()
         if not isinstance(self.hud, NullHUD) and getattr(self, "hud_visible", True):
-            self.post.draw_ui(self._draw_hud())
+            if self._hud_uploaded and not getattr(self.hud, "dirty", True) and self._ui_surface is not None \
+                    and self._ui_surface.get_size() == (self.fw, self.fh):
+                self.post.draw_ui(None, reuse=True)          # HUD unchanged (hud.dirty False): keep last texture
+            else:
+                data = self._draw_hud()
+                self._hud_uploaded = data is not None
+                self.post.draw_ui(data)
         if self.screen_fbo is not None:
             self.post.present(self.screen_fbo, (self.fw, self.fh))
         tm["hud"] = time.perf_counter() - t4
@@ -1145,6 +1152,8 @@ class Renderer:
         self.timings.update(tm)
         self._rgb_dirty = False
         self._frames_rendered += 1
+
+    _hud_uploaded = False
 
     def _draw_hud(self):
         pg = self._pg
@@ -1373,7 +1382,7 @@ class Renderer:
         cre = [v for v in self.vents.values() if v.kind == "creature" and not v.gone and v.vis_alpha > 0.02 and v.alpha > 0.01]
         if not cre:
             return np.zeros((0, 20), F4)
-        cre.sort(key=lambda v: (v.z > 0, v.y + v.size))
+        cre.sort(key=lambda v: (v.z > 0, v.y + v.size + (0.5 if getattr(v, 'mounted_on', -1) >= 0 else 0.0)))
         pts = np.array([[v.cx, v.cy] for v in cre], F4)
         light = self._light_at(pts)
         shadows, bodies, overlays = [], [], []
@@ -1386,6 +1395,10 @@ class Renderer:
             bob = (0.05 * math.sin(t * 2.0 + ve.bob_phase) + 0.02 * z) if z > 0 else 0.0
             rad = ve.size * 0.5 * 0.94 * ve.scale * ve.spawn_scale * (1.0 + 0.07 * z)
             cx, cy = ve.cx, ve.cy - bob - 0.10 * z
+            if getattr(ve, 'mounted_on', -1) >= 0:          # rider: smaller, perched on the mount
+                rad *= 0.62
+                mv = self.vents.get(ve.mounted_on)
+                cy -= 0.22 * (mv.size if mv is not None else 1)
             lit = np.clip(light[i] * 1.2, 0.0, 1.6) * 0.62 + 0.38
             lit = lit * (1 - 0.8 * self._dark_at(cx, cy))
             a = ve.alpha * ve.vis_alpha * (0.35 if ve.invisible else 1.0)

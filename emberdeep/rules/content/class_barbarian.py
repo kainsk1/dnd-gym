@@ -57,6 +57,10 @@ class DangerSense(Feature):
     def save_mods(self, world, ctx):
         s = ctx.saver
         if s.eid == self.me and ctx.ability == Ability.DEX and not s.cond_mask & (_BLIND_DEAF | INCAP_MASK):
+            src = ctx.source
+            if isinstance(src, int) and 0 <= src < len(world.entities) and world.entities[src].present \
+                    and not world.sees(s.eid, src):
+                return                                  # an effect you cannot see (a hidden caster)
             ctx.adv.append("danger_sense")
 
 

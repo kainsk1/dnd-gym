@@ -34,7 +34,7 @@ def desired_item_effects(c) -> dict:
     """item def id -> EffectSpec for every worn or carried item whose effect is active."""
     out = {}
     for slot, it in c.equipped.items():
-        if slot in _PLAIN_SLOTS or it is None or it not in c.inventory:
+        if slot in _PLAIN_SLOTS or it is None or it not in c.inventory or not it.active:
             continue
         spec = getattr(it.def_, "effect", None)
         if spec is not None:
@@ -42,7 +42,7 @@ def desired_item_effects(c) -> dict:
     for it in c.inventory:
         d = it.def_
         spec = getattr(d, "effect", None)
-        if spec is not None and (d.id in CARRIED_IDS or (getattr(d, "kind", "") == "wand" and not d.use_spell)):
+        if spec is not None and it.active and (d.id in CARRIED_IDS or (getattr(d, "kind", "") == "wand" and not d.use_spell)):
             out[d.id] = spec
     return out
 

@@ -129,14 +129,28 @@ def test_font_of_inspiration_recharges_on_short_rest():
     assert c2.resources["bardic_inspiration"] == c2.resource_max["bardic_inspiration"]
 
 
-def test_song_of_rest_heals_wounded_allies_extra():
+def test_song_of_rest_adds_a_die_when_hit_dice_are_spent_once_per_creature():
+    """SRD: only creatures that regain hit points by spending Hit Dice get the extra d6, once each per rest."""
     w, bd, ft, g = setup(3)
     f = w.entities[ft]
     f.hp = 1
-    f.hit_dice_left = 0                                # no hit dice: only the song heals
-    script(w, d(4, 6))
+    f.hit_die = 8
+    script(w, d(2, 8), d(4, 6), d(2, 8), d(6, 6))               # hit die 2, song 4, (a second die 2 gets no song)
+    events(w)
     w.short_rest([w.entities[bd], f])
-    assert f.hp == 1 + 4
+    heals = events(w, ET.HEAL)
+    song = [e for e in heals if e.data.get("source") == "song_of_rest" and e.dst == ft]
+    dice = [e for e in heals if e.data.get("source") == "hit_die" and e.dst == ft]
+    assert len(song) == 1 and song[0].amount == 4 and len(dice) >= 1       # one song die, however many Hit Dice
+    # a wounded ally that spends no hit die is not healed by the song
+    w2, bd2, ft2, g2 = setup(3)
+    f2 = w2.entities[ft2]
+    f2.hp = 1
+    f2.hit_dice_left = 0
+    script(w2, d(4, 6))
+    w2.short_rest([w2.entities[bd2], f2])
+    assert f2.hp == 1
+    assert not [e for e in events(w2, ET.HEAL) if e.data.get("source") == "song_of_rest" and e.dst == ft2]
 
 
 def test_bonus_proficiencies_lore_and_expertise():

@@ -127,10 +127,24 @@ def test_quickened_spell_keeps_the_action():
     assert c.ts.action_used
 
 
-def test_quickened_spell_cannot_be_armed_after_the_action():
-    w, s, g = setup(5)
+def test_quickened_spell_can_be_armed_after_the_action():
+    """v1.1: arm after the Action was spent on a cantrip; the leveled spell then goes on the bonus action."""
+    w, s, g = setup(5, spells=("magic_missile", "shield", "sleep", "misty_step", "fireball"))
+    c = w.entities[s]
     script(w, d(15), d(5, 10))
     use(w, s, "fire_bolt", g)
+    assert c.ts.action_used and not c.ts.bonus_used
+    assert usable(w, s, "quickened_spell")
+    use(w, s, "quickened_spell")
+    assert usable(w, s, "magic_missile")                       # now castable as a bonus action
+    use(w, s, "magic_missile", g)
+    assert c.ts.bonus_used and sp(w, s) == 3
+    assert not usable(w, s, "sleep")                           # bonus-action spell rule: no further leveled spells
+
+
+def test_quickened_spell_not_after_a_leveled_action_spell():
+    w, s, g = setup(5, spells=("magic_missile", "shield", "sleep"))
+    use(w, s, "magic_missile", g)
     assert not usable(w, s, "quickened_spell")
 
 

@@ -15,6 +15,8 @@ import numpy as np
 from emberdeep.core import _geom_fallback as GF
 from emberdeep.core import pathing as PA
 from emberdeep.core import abilities as AB
+from emberdeep.core import fastmask as FM
+from emberdeep.core import fastkernels as FK
 from emberdeep.core import dice as D
 from emberdeep.core import effects as EF
 from emberdeep.core import resolution as R
@@ -94,6 +96,9 @@ class RulesConfig:
     max_actions_per_turn: int = 40            # after this many atomic actions in one turn the engine ends it (0 = off)
     exploration_turns: bool = True
     opportunity_attacks: bool = True
+    encumbrance: str = "capacity"             # "off" | "capacity" (over STR x 15 lb -> speed 5 ft) | "variant" (SRD variant)
+    attunement: bool = True                   # attunement-gated items need attunement (max 3 per creature)
+    mounts: bool = True                       # mounted combat rules
     conjure_animals_beast: str = "wolf"
     wandering_monster_ids: tuple = ()
 
@@ -164,6 +169,7 @@ class _Core:
         self._ev_total = 0
         self._ev_drained = 0
         self.step_count = 0
+        self.state_version = 0          # monotonic; bumped by step / start / spawn / restore (cache key for env + AI)
         self.round = 0
         self.mode = int(GameMode.EXPLORATION)
         self.order: list[int] = []
@@ -196,6 +202,12 @@ class _Core:
         self.last_step_valid = True
         self._vis_epoch = 0
         self._sees_cache: dict = {}
+        self._mm_cache: dict = {}
+        self._af_cache: dict = {}
+        self._share_any = None
+        self._usable_memo = None            # per-ability_mask-call memo of shared usable() sub-results
+        self._fov_ref = False
+        self._mm_costs = np.zeros(8, np.int64)
         self._cover_cache: dict = {}
         self._fov_cache: dict = {}
         self._carried_lights_key = None
@@ -204,6 +216,8 @@ class _Core:
         self.stats: dict = {}
         self.leg_pending: list = []
         self.regions = {k: list(v) for k, v in map_data.regions.items()}
+        self._n_riders = 0              # creatures currently mounted
+        self._mount_count = 0           # creatures with the 'mount' tag that were spawned (enables mount abilities)
         self.meta: dict = {}
         from emberdeep.rules.decisions_auto import default_auto_decider
         self.auto_decider = default_auto_decider
@@ -309,6 +323,7 @@ class _Core:
     def spawn_creature(self, c: Creature, light: bool | None = None) -> int:
         """Add a creature to the world (placing it on the nearest free square if its square is taken)."""
         c.eid = len(self.entities)
+        self.state_version += 1
         self.entities.append(c)
         self.creatures.append(c)
         for h in c.hooks:
@@ -333,7 +348,12 @@ class _Core:
         if c.light is not None:
             self.map.light_version += 1
         self._run_on_spawn(c)
+        self.auto_attune(c, spawn=True)
         self.sync_items(c)
+        if "mount" in c.tags and self.rules.mounts:
+            self._mount_count += 1
+            for o in self.creatures:
+                o.ab_cache = None                  # riders gain the 'mount' ability
         return c.eid
 
     def add_to_order(self, c, initiative: int | None = None, after: int | None = None) -> None:
@@ -408,6 +428,68 @@ class _Core:
                 h.on_spawn(self, c)
             c.hook_index = None
         c.fstate.pop("_spawned", None)
+
+    # ------------------------------------------------------------------ attunement (SRD: Attunement)
+    MAX_ATTUNED = 3
+
+    @staticmethod
+    def attuned_items(c) -> list:
+        return [it for it in c.inventory if it.attuned]
+
+    def attune(self, c, item) -> bool:
+        """Attune ``c`` to ``item`` (it must be carried, require attunement and fit the limit of three).  The SRD
+        takes a short rest; the engine does it at rests (``auto_attune``) and at spawn, and scenarios/tests call this
+        directly.  Returns True when ``item`` is attuned afterwards."""
+        if isinstance(c, int):
+            c = self.entities[c]
+        if item not in c.inventory or not getattr(item.def_, "attunement", False):
+            return False
+        if item.attuned:
+            return True
+        if len(self.attuned_items(c)) >= self.MAX_ATTUNED:
+            return False
+        item.attuned = True
+        c.touch()
+        self.emit(ET.EQUIP, c.eid, -1, 0, -1, {"item": item.id, "slot": "attune", "attuned": True})
+        self.sync_items(c)
+        return True
+
+    def unattune(self, c, item) -> bool:
+        if isinstance(c, int):
+            c = self.entities[c]
+        if not item.attuned:
+            return False
+        item.attuned = False
+        c.touch()
+        self.sync_items(c)
+        return True
+
+    def auto_attune(self, c, spawn: bool = False) -> int:
+        """Fill free attunement slots with the most valuable unattuned attunement items (worn/equipped first at
+        spawn).  With ``rules.attunement`` off every item is attuned.  Returns the number of new attunements."""
+        n = 0
+        if not self.rules.attunement:
+            for it in c.inventory:
+                if getattr(it.def_, "attunement", False) and not it.attuned:
+                    it.attuned = True
+                    n += 1
+            if n:
+                c.touch()
+            return n
+        free = self.MAX_ATTUNED - len(self.attuned_items(c))
+        if free <= 0:
+            return 0
+        worn = {id(v) for v in c.equipped.values() if v is not None}
+        cands = [it for it in c.inventory if getattr(it.def_, "attunement", False) and not it.attuned]
+        if not cands:
+            return 0
+        cands.sort(key=lambda it: (-(1 if spawn and id(it) in worn else 0), -float(it.def_.value_gp), it.id))
+        for it in cands[:free]:
+            it.attuned = True
+            n += 1
+        if n:
+            c.touch()
+        return n
 
     def sync_items(self, c) -> None:
         """Attach / detach the effects of worn and carried magic items (``rules.content.item_hooks``)."""
@@ -523,6 +605,7 @@ class _Core:
         """EPISODE_START; roll initiative at once when ``start_mode == 'combat'``."""
         if self.started:
             return
+        self.state_version += 1
         self.started = True
         self.emit(ET.EPISODE_START, -1, -1, 0, -1, {"scenario": self.name, "seed": self.seed})
         from emberdeep.core import objectives as OB
@@ -530,12 +613,35 @@ class _Core:
             if c.present:
                 c.aware = {}
         self.quiet_rounds = 0
+        self._auto_mount()
         if self.start_mode == "combat":
             self._begin_combat(initial=True)
         else:
             self._begin_exploration_round(first=True)
         OB.evaluate(self)
         self._settle()
+
+    def _auto_mount(self) -> None:
+        """Spawn tags ``ride:<tag>`` seat a creature on the nearest free creature that carries ``<tag>`` and is a valid
+        mount (scenario support; mounting is free at the start of the episode)."""
+        if not self.rules.mounts or self._mount_count == 0:
+            return
+        for r in self.creatures:
+            for t in r.tags:
+                if not (isinstance(t, str) and t.startswith("ride:")) or r.mount >= 0:
+                    continue
+                want = t[5:]
+                cands = [m for m in self.creatures if m is not r and m.present and m.rider < 0 and want in m.tags
+                         and "mount" in m.tags and self.relation(r.eid, m.eid) == Relation.ALLIED
+                         and int(m.size) > int(r.size)]
+                if not cands:
+                    continue
+                cands.sort(key=lambda m: (max(abs(m.x - r.x), abs(m.y - r.y)), m.eid))
+                m = cands[0]
+                self.map.unplace(r)
+                r.x, r.y, r.z = m.x, m.y, m.z
+                r.ts.reset(R.base_speed(self, r))
+                self.mount_up(r, m, free=True)
 
     def decider(self) -> int:
         if self.done:
@@ -728,10 +834,14 @@ class _Core:
         # speed may have changed from effects applied above
         if not c.status & S.SURPRISED and ts.movement_left > 0:
             ts.movement_left = R.base_speed(self, c) if not ts.dashed else ts.movement_left
+        if c.mount >= 0:
+            self._mount_turn_start(c)
         self._settle_pending_combat_only()
 
     def _auto_turn(self, c) -> bool:
         if not c.present or c.status & S.DEAD:
+            return True
+        if c.rider >= 0 and c.mount_controlled:           # a controlled mount acts on its rider's turn
             return True
         if c.status & (S.DYING | S.STABLE | S.SURPRISED):
             return True
@@ -949,6 +1059,21 @@ class _Core:
 
     def on_downed(self, c) -> None:
         self._release_grapples(c)
+        if c.rider >= 0:
+            self.mount_fall(self.entities[c.rider], "mount_down")
+        elif c.mount >= 0:
+            self.dismount(c, free=True, reason="fell")
+
+    def on_prone_mounted(self, c) -> None:
+        """A mount was knocked prone (its rider may step off, else falls prone) or a rider was (DEX save DC 10 or
+        fall off; success keeps the seat and the rider upright)."""
+        if c.rider >= 0:
+            self.mount_fall(self.entities[c.rider], "mount_prone")
+        elif c.mount >= 0:
+            if R.saving_throw(self, c, Ability.DEX, 10, -1, name="mounted"):
+                R.remove_condition(self, c, Condition.PRONE)
+            else:
+                self.dismount(c, free=True, reason="fell")
 
     def on_revived(self, c) -> None:
         pass
@@ -973,6 +1098,8 @@ class _Core:
         while not self.done and guard < 500:
             guard += 1
             self._run_deferred()
+            if self._n_riders:
+                self._sync_riders()
             if self.mode == int(GameMode.EXPLORATION):
                 if not self._combat_pending and self._vis_epoch != getattr(self, "_detect_epoch", -1):
                     self._detect_epoch = self._vis_epoch
@@ -1064,6 +1191,7 @@ class _Core:
         """Apply ``act`` for ``decider()``; advances turns and auto-handles dying/incapacitated turns."""
         if self.done:
             return
+        self.state_version += 1
         if self.pending_decision is not None:
             rp = self._replay
             if act.kind != ActKind.DECIDE or not (0 <= act.arg < len(self.pending_decision.options)):
@@ -1122,6 +1250,10 @@ class _Core:
         agent = ControllerKind.AGENT
         cx, cy = c.x, c.y
         cheb = GF.geo.chebyshev
+        for o in self.creatures:                      # POST_ROLL features (Bardic Inspiration, Cutting Words)
+            if o.controller == agent and o.present and cheb(o.x, o.y, cx, cy) <= 30 and \
+                    any(getattr(h, "POST_ROLL", False) for h in o.hooks):
+                return True
 
         def capable(o):
             return bool(R.hooks(o, "reaction_options") or (o.spells and R.reaction_spells(self, o)))
@@ -1139,8 +1271,9 @@ class _Core:
                     return True
             return False
         if k == ActKind.END_TURN:
-            if not any(o.legendary_max > 0 and o.present for o in self.creatures):
-                return False
+            if not any(o.legendary_max > 0 and o.present for o in self.creatures) and not (
+                    self.zones and any(z.kind == "mh_gaze" for z in self.zones)):
+                return False                                   # (gaze auras ask "avert your eyes?" at turn start)
             return any(o.controller == agent and o.present and capable(o) for o in self.creatures)
         if c.controller == agent:
             if R.hooks(c, "reaction_options"):
@@ -1265,6 +1398,15 @@ class _Vision(_Core):
         ents = self.entities
         A = ents[a]
         B = ents[b]
+        if self._n_riders:                               # a rider occupies its mount's space
+            if A.kind == 0 and A.mount >= 0:
+                if A.mount == b:
+                    return 0
+                A = ents[A.mount]
+            if B.kind == 0 and B.mount >= 0:
+                if B.mount == a:
+                    return 0
+                B = ents[B.mount]
         ax = A.x
         ay = A.y
         bx = B.x
@@ -1335,9 +1477,37 @@ class _Vision(_Core):
             self._opnd = oc
         return oc[1]
 
+    def _observer_opaque(self, A) -> np.ndarray:
+        """Sight-blocking grid as seen by creature ``A``: illusions it has discerned (Minor Illusion) do not block its view."""
+        seen = self.ext.get("illusion_seen")
+        if not seen:
+            return self.map.opaque
+        zs = tuple(sorted(z.zid for z in self.zones if z.kind == "minor_illusion" and A.eid in seen.get(z.zid, ())))
+        if not zs:
+            return self.map.opaque
+        key = (self.map.opaque_version, zs)
+        cache = self.__dict__.get("_obs_op")
+        if cache is None or cache[0] != key:
+            m = self.map
+            op = m.opaque.copy()
+            for z in self.zones:
+                if z.zid in zs:
+                    for (x, y) in z.cells:
+                        op[y, x] = m.static.blocks_sight[y, x] or m.door_closed[y, x]
+            self._obs_op = cache = (key, op)
+        return cache[1]
+
+    def discern_illusion(self, z, eid: int) -> None:
+        """Creature ``eid`` sees through the illusion zone ``z`` (it still blocks everybody else's sight)."""
+        d = dict(self.ext.get("illusion_seen") or {})
+        if eid not in d.get(z.zid, ()):
+            d[z.zid] = tuple(d.get(z.zid, ())) + (eid,)
+            self.ext["illusion_seen"] = d
+            self.vis_dirty()
+
     def _los_cells(self, A, B, op=None) -> bool:
         if op is None:
-            op = self.map.opaque
+            op = self._observer_opaque(A) if self.ext else self.map.opaque
         asz = A.size_sq if A.kind == EntityKind.CREATURE else 1
         bsz = B.size_sq if B.kind == EntityKind.CREATURE else 1
         if asz == 1 and bsz == 1:
@@ -1345,6 +1515,26 @@ class _Vision(_Core):
         for ac in ((A.x, A.y),) if asz == 1 else A.cells():
             for bc in ((B.x, B.y),) if bsz == 1 else B.cells():
                 if geo.has_los(op, ac[0], ac[1], bc[0], bc[1]):
+                    return True
+        return False
+
+    def projectile_blocked(self, a, b, ctx=None) -> bool:
+        """Does the flight of an ordinary ranged weapon attack from ``a`` to ``b`` cross a projectile barrier?  Zones with
+        ``params['blocks_projectiles']`` (Wind Wall), zone implementations offering ``blocks_projectile(world, z, a, b)``
+        and ``projectile_block(world, ctx)`` hooks on the target are consulted (the attacker's own square is ignored)."""
+        if self.zones:
+            own = frozenset(a.cells())
+            for z in self.zones:
+                if z.params.get("blocks_projectiles"):
+                    if Z.segment_crosses_zone(self, z, a, b, own):
+                        return True
+                else:
+                    f = getattr(z.impl, "blocks_projectile", None)
+                    if f is not None and f(self, z, a, b):
+                        return True
+        if b.hooks:
+            for h in R.hooks(b, "projectile_block"):
+                if h.projectile_block(self, ctx):
                     return True
         return False
 
@@ -1375,6 +1565,9 @@ class _Vision(_Core):
         s = A.senses
         m = self.map
         dft = d * 5
+        if A.z < 0 or B.z < 0:                         # underground: only tremorsense connects surface and burrow
+            ts_ = s.get("tremorsense", 0)
+            return bool(ts_ and dft <= ts_ and A.z <= 0 and B.z <= 0)
         dsight = bool(s.get("devils_sight", 0) and dft <= s["devils_sight"])   # sees through magical darkness
         if not self._los_cells(A, B, self._opaque_without_darkness() if dsight and m.zone_dark.any() else None):
             ts_ = s.get("tremorsense", 0)
@@ -1456,6 +1649,20 @@ class _Vision(_Core):
             self.emit(ET.REVEALED, -1, c.eid, 0, -1, {"reason": reason})
             self.vis_dirty()
 
+    def visible_cells_ref(self, eid: int) -> np.ndarray:
+        """Reference implementation (NumPy expressions, uncached); kept for differential tests."""
+        saved = self._fov_cache.pop(eid, None)
+        self._fov_ref = True
+        try:
+            out = self.visible_cells(eid)
+        finally:
+            self._fov_ref = False
+            if saved is not None:
+                self._fov_cache[eid] = saved
+            else:
+                self._fov_cache.pop(eid, None)
+        return out
+
     def visible_cells(self, eid: int) -> np.ndarray:
         """Boolean [H, W] grid of cells the creature currently sees (FOV x light x senses)."""
         c = self.entities[eid]
@@ -1471,6 +1678,13 @@ class _Vision(_Core):
         s = c.senses
         rad = self.rules.sight_radius
         sz = c.size_sq
+        if (sz == 1 and not self._fov_ref and not c.cond_mask & 1 and not m.zone_heavy[c.y, c.x]
+                and not s.get("devils_sight", 0)
+                and not s.get("blindsight", 0) and not s.get("truesight", 0)):
+            FK.visible_cells_into(out, m.opaque, self.light_grid(), m.zone_heavy, m.zone_dark, c.x, c.y, rad,
+                                  s.get("darkvision", 0))
+            self._fov_cache[eid] = out
+            return out
         x0, x1 = max(0, c.x - rad), min(W, c.x + sz + rad)
         y0, y1 = max(0, c.y - rad), min(H, c.y + sz + rad)
         ys, xs = _index_grids(H, W)
@@ -1533,7 +1747,8 @@ class _Vision(_Core):
         return self.distance(listener.eid, speaker.eid) <= r
 
     def hostile_adjacent(self, c) -> bool:
-        """A hostile, able creature within 5 ft of ``c`` (ranged attacks have disadvantage)."""
+        """A hostile, able creature within 5 ft of ``c`` (ranged attacks have disadvantage).  Not memoised: kills, shoves
+        and condition changes inside a single engine step must be seen by the next attack of the same step."""
         for o in self.creatures:
             if o is c or not o.present or o.cond_mask & INCAP_MASK or o.status & S.DEAD:
                 continue
@@ -1576,7 +1791,7 @@ class _Vision(_Core):
 
 
 # =============================================================================== movement
-_KIND = {"walk": 0, "fly": 1, "swim": 2, "climb": 3, "crawl": 4}
+_KIND = {"walk": 0, "fly": 1, "swim": 2, "climb": 3, "crawl": 4, "burrow": 5}
 
 
 class _Movement(_Vision):
@@ -1592,7 +1807,17 @@ class _Movement(_Vision):
         if nx < 0 or ny < 0 or nx + s > m.W or ny + s > m.H:
             return None
         st = m.static
+        if c.z < 0:
+            return self._burrow_step_cost(c, dx, dy, nx, ny)
         flying = c.z > 0
+        spd = c.speeds
+        squeeze = False
+        if not flying and (m.blocked[ny, nx] if s == 1 else m.blocked[ny:ny + s, nx:nx + s].any()):
+            if self._phases(c):                                  # incorporeal: through objects as difficult terrain
+                if self._phase_cells_ok(nx, ny, s):
+                    return 10
+            elif s > 1 and self._squeeze_ok(nx, ny, s):          # SRD: squeeze through a space one size smaller
+                squeeze = True
         if s == 1 and not flying and not self.zones and not c.grappling and not dx * dy:
             # fast path: orthogonal step of a Medium-or-smaller walker with no zones in play
             if m.blocked[ny, nx] or st.pit[ny, nx]:
@@ -1602,19 +1827,53 @@ class _Movement(_Vision):
                 return None
             extra = 0
             if st.difficult[ny, nx] and not self._ignores_difficult(c, nx, ny):
-                if not (st.water[ny, nx] and c.speeds.get("swim", 0) > 0):
+                if not (st.water[ny, nx] and spd.get("swim", 0) > 0) and \
+                        not (st.climbable[ny, nx] and spd.get("climb", 0) > 0):
                     extra += 1
-            elif st.deep[ny, nx] and c.speeds.get("swim", 0) <= 0:
+            elif st.deep[ny, nx] and spd.get("swim", 0) <= 0:
                 extra += 1
             if c.cond_mask >> 10 & 1:
                 extra += 1
             return 5 * (1 + extra)
+        if s == 1 and not flying:                       # scalar twin of the general path below (no array slices)
+            if m.blocked[ny, nx] or st.pit[ny, nx]:
+                return None
+            o = m.occ[ny, nx]
+            if o >= 0 and o != c.eid and not self._enter_ok(c, self.entities[int(o)], pass_allies):
+                return None
+            if dx and dy and m.blocked[c.y, nx] and m.blocked[ny, c.x]:
+                return None
+            extra = 0
+            ign = self._ignores_difficult(c, nx, ny)
+            if not ign:
+                ds = st.difficult[ny, nx]
+                if ds:
+                    if not ((spd.get("swim", 0) > 0 and st.water[ny, nx]) or
+                            (spd.get("climb", 0) > 0 and st.climbable[ny, nx])):
+                        extra += 1
+                elif st.deep[ny, nx] and spd.get("swim", 0) <= 0:
+                    extra += 1
+                if m.zone_diff[ny, nx]:
+                    extra += 1
+            if c.cond_mask >> Condition.PRONE & 1:
+                extra += 1
+            if self.zones:
+                for z in self.zones:
+                    if z.params.get("half_speed") and (nx, ny) in z.cellset:
+                        extra += z.impl.move_mult(self, z, c) - 1
+            if c.grappling and self._drag_penalty(c):
+                extra += 1
+            base = 5
+            if dx and dy and self.rules.diagonal_rule == "5-10-5" and (c.ts.diag_moves & 1):
+                base = 10
+            return base * (1 + extra)
         if flying:
-            blocked = st.blocks_sight[ny:ny + s, nx:nx + s] | m.door_closed[ny:ny + s, nx:nx + s]
+            blocked = st.blocks_sight[ny:ny + s, nx:nx + s] | m.door_closed[ny:ny + s, nx:nx + s] | \
+                m.sealed[ny:ny + s, nx:nx + s]
             if blocked.any():
                 return None
         else:
-            if m.blocked[ny:ny + s, nx:nx + s].any():
+            if m.blocked[ny:ny + s, nx:nx + s].any() and not squeeze:
                 return None
             if st.pit[ny:ny + s, nx:nx + s].any():
                 return None
@@ -1635,12 +1894,14 @@ class _Movement(_Vision):
         if not flying and not ign:
             ds = st.difficult[ny:ny + s, nx:nx + s]
             if ds.any():
-                wat = st.water[ny:ny + s, nx:nx + s]
-                if wat.any() and c.speeds.get("swim", 0) > 0:
-                    pass
-                else:
+                free = np.zeros_like(ds)
+                if spd.get("swim", 0) > 0:
+                    free |= st.water[ny:ny + s, nx:nx + s]
+                if spd.get("climb", 0) > 0:
+                    free |= st.climbable[ny:ny + s, nx:nx + s]
+                if (ds & ~free).any():
                     extra += 1
-            if st.deep[ny:ny + s, nx:nx + s].any() and c.speeds.get("swim", 0) <= 0:
+            if st.deep[ny:ny + s, nx:nx + s].any() and spd.get("swim", 0) <= 0:
                 extra += 1 if not ds.any() else 0
         if not ign and m.zone_diff[ny:ny + s, nx:nx + s].any():
             extra += 1
@@ -1655,7 +1916,94 @@ class _Movement(_Vision):
         base = 5
         if dx and dy and self.rules.diagonal_rule == "5-10-5" and (c.ts.diag_moves & 1):
             base = 10
-        return base * (1 + extra)
+        return base * (1 + extra + (1 if squeeze and not self._free_squeeze(c) else 0))
+
+    # ------------------------------------------------------------------ squeezing & incorporeal movement
+    @staticmethod
+    def _phases(c) -> bool:
+        """May the creature move through walls and other objects (Incorporeal Movement)?"""
+        return "incorporeal_movement" in c.trait_ids
+
+    @staticmethod
+    def _free_squeeze(c) -> bool:
+        """Amorphous oozes, air forms and swarms move through openings as narrow as an inch without squeezing penalties."""
+        t = c.trait_ids
+        return "amorphous" in t or "air_form" in t or "swarm" in t
+
+    def _phase_cells_ok(self, x: int, y: int, s: int) -> bool:
+        m = self.map
+        st = m.static
+        sub = m.blocked[y:y + s, x:x + s]
+        return bool((~sub | st.solid_rock[y:y + s, x:x + s] | m.door_closed[y:y + s, x:x + s]).all())
+
+    def _squeeze_ok(self, x: int, y: int, s: int) -> bool:
+        """A creature of ``s`` squares may squeeze into a footprint at (x, y) when its top-left (s-1) x (s-1) squares are
+        free of obstacles (a space big enough for a creature one size smaller); never into pits, lava or closed doors."""
+        m = self.map
+        k = s - 1
+        if k < 1:
+            return False
+        if m.blocked[y:y + k, x:x + k].any():
+            return False
+        return not (m.static.pit[y:y + s, x:x + s].any() or m.door_closed[y:y + s, x:x + s].any())
+
+    def _squeeze_blockers(self, s: int) -> np.ndarray:
+        """Anchors whose s x s footprint touches a pit or closed door (cannot be squeezed into)."""
+        m = self.map
+        bad = m.static.pit | m.door_closed
+        return GF.geo.inflate_blocked(bad, s)
+
+    _MOVE_FLAGS = int(S.MOUNTED | S.CARRYING_RIDER | S.SQUEEZING | S.BURROWED)
+
+    def refresh_move_flags(self, c) -> None:
+        """Recompute the observable status flags MOUNTED / CARRYING_RIDER / SQUEEZING / BURROWED of ``c``."""
+        new = c.status & ~self._MOVE_FLAGS
+        if c.mount >= 0:
+            new |= int(S.MOUNTED)
+        if c.rider >= 0:
+            new |= int(S.CARRYING_RIDER)
+        if c.z < 0:
+            new |= int(S.BURROWED)
+        elif c.size_sq > 1 and self.is_squeezing(c):
+            new |= int(S.SQUEEZING)
+        c.status = new
+
+    def is_squeezing(self, c) -> bool:
+        """Is the creature currently squeezing through a space narrower than its size (SRD: Squeezing into a Smaller Space)?"""
+        if c.size_sq <= 1 or c.z != 0 or not c.present:
+            return False
+        s = c.size_sq
+        return bool(self.map.blocked[c.y:c.y + s, c.x:c.x + s].any()) and not self._phases(c) \
+            and not self._free_squeeze(c)
+
+    # ------------------------------------------------------------------ burrowing (SRD: burrow speed)
+    @staticmethod
+    def _burrow_rock(c) -> bool:
+        """May the creature tunnel through solid stone (Earth Glide)?"""
+        return "earth_glide" in c.trait_ids
+
+    def _burrow_ratio(self, c) -> int:
+        """Feet of the walking-speed budget spent per 5-ft square tunnelled (walk speed / burrow speed, rounded up)."""
+        b = c.speeds.get("burrow", 0)
+        w = max(c.speeds.get("walk", 0), 0)
+        return 1 if b <= 0 or w <= b else -(-w // b)
+
+    def _burrow_cells_ok(self, c, x: int, y: int) -> bool:
+        s = c.size_sq
+        st = self.map.static
+        m = self.map
+        if x < 0 or y < 0 or x + s > m.W or y + s > m.H:
+            return False
+        if m.door_closed[y:y + s, x:x + s].any() or m.sealed[y:y + s, x:x + s].any():
+            return False
+        if self._burrow_rock(c):
+            return not st.no_burrow[y:y + s, x:x + s].any()
+        return bool(st.diggable[y:y + s, x:x + s].all())
+
+    def _burrow_step_cost(self, c, dx: int, dy: int, nx: int, ny: int):
+        if not self._burrow_cells_ok(c, nx, ny):
+            return None
+        return 5 * self._burrow_ratio(c)
 
     def _shares(self, a, b) -> bool:
         """May ``a`` and ``b`` occupy the same square (``may_share_space`` hook on either side)?"""
@@ -1712,14 +2060,25 @@ class _Movement(_Vision):
         if d < 0 or d > 7:
             return False
         dx, dy = DIR_VECTORS[d]
+        if c.mount >= 0:                                   # mounted: the controlled mount moves (and spends its speed)
+            m = self._steed(c)
+            if m is None:
+                return False
+            if c.cond_mask & INCAP_MASK or c.status & S.SURPRISED:
+                return False
+            ok = self.try_step(m, dx, dy)
+            self._mounted_move_done(c, m)
+            return ok
         return self.try_step(c, dx, dy)
 
     def try_step(self, c, dx: int, dy: int, pass_allies: bool = False, kind: str | None = None) -> bool:
         """One square of voluntary movement, with opportunity attacks, hazards, zones and traps."""
         ts = c.ts
-        if c.cond_mask & INCAP_MASK or c.status & S.SURPRISED:
+        if c.cond_mask & INCAP_MASK or (c.status & S.SURPRISED and not (c.rider >= 0 and c.mount_controlled)):
             return False
         cost = self._step_cost(c, dx, dy, pass_allies)
+        if cost is None and c.z == 0 and c.mount < 0:
+            return self._try_jump(c, dx, dy)                 # a pit ahead: long jump over it when the creature can
         if cost is None or cost > ts.movement_left or R.base_speed(self, c) <= 0:
             return False
         if c.cond_mask & 8 and self._frightened_blocks(c, dx, dy):
@@ -1737,12 +2096,119 @@ class _Movement(_Vision):
         self._do_step(c, nx, ny, cost, kind)
         return True
 
+    # ------------------------------------------------------------------ jumping (SRD: Jumping)
+    def jump_feet(self, c, run_up: bool) -> int:
+        """Long jump distance: STR score in feet with a 10-ft running start, half of it from a standing start; the Jump
+        spell triples it."""
+        ft = int(c.scores[0]) if run_up else int(c.scores[0]) // 2
+        if any(e.ID == "jump" for e in c.effects):
+            ft *= 3
+        return ft
+
+    def _run_up(self, c, dx: int, dy: int) -> bool:
+        r = c.fstate.get("run")
+        return bool(r and r.get("d") == (dx, dy) and r.get("n", 0) >= 2 and r.get("t") == (self.round, self.active))
+
+    def _landing_ok(self, c, x: int, y: int) -> bool:
+        s = c.size_sq
+        m = self.map
+        if x < 0 or y < 0 or x + s > m.W or y + s > m.H:
+            return False
+        if m.blocked[y:y + s, x:x + s].any() or m.static.lava[y:y + s, x:x + s].any():
+            return False
+        return self._cell_free_for(c, x, y)
+
+    def _try_jump(self, c, dx: int, dy: int) -> bool:
+        """A step into a pit square becomes a long jump over the chasm when the creature has the movement and the jump
+        distance (running start: moved >= 10 ft in a straight line this turn); the jump costs one square of movement per
+        5 ft travelled.  The landing square must be free solid ground in the same direction."""
+        ts = c.ts
+        if c.cond_mask & (INCAP_MASK | (1 << 11)) or c.status & S.SURPRISED or R.base_speed(self, c) <= 0:
+            return False
+        if self._phases(c) or c.speeds.get("fly", 0) > 0:
+            return False
+        s = c.size_sq
+        m = self.map
+        st = m.static
+        x, y = c.x + dx, c.y + dy
+        if x < 0 or y < 0 or x + s > m.W or y + s > m.H or not st.pit[y:y + s, x:x + s].any():
+            return False
+        ft = self.jump_feet(c, self._run_up(c, dx, dy))
+        n = 1
+        while st.pit[y:y + s, x:x + s].any():
+            n += 1
+            x += dx
+            y += dy
+            if n * 5 > ft or x < 0 or y < 0 or x + s > m.W or y + s > m.H:
+                return False
+        if n * 5 > ft or n * 5 > ts.movement_left or not self._landing_ok(c, x, y):
+            return False
+        if c.cond_mask & 8 and self._frightened_blocks(c, dx, dy):
+            return False
+        if self.rules.opportunity_attacks and not (c.status & S.DISENGAGED or ts.disengaged):
+            self._provoke(c, c.x + dx, c.y + dy)
+            if not c.present or c.status & S.DEAD or c.cond_mask & INCAP_MASK:
+                self._interrupt = True
+                return True
+        self._do_step(c, x, y, n * 5, "walk")
+        return True
+
+    def _jumpable_pits(self, c) -> np.ndarray | None:
+        """Pit squares a creature could plan to jump across from a standing start (narrow chasms only, within its remaining
+        movement); used by the approach planner so that a masked-in APPROACH always executes."""
+        st = self.map.static
+        if c.size_sq != 1 or not st.pit.any() or c.speeds.get("fly", 0) > 0 or self._phases(c):
+            return None
+        lmax = min(self.jump_feet(c, False), c.ts.movement_left) // 5 - 1      # chasm width = squares travelled - 1
+        if lmax < 1:
+            return None
+        key = self.map.move_version
+        cache = self.__dict__.get("_pit_runs")
+        if cache is None or cache[0] != key:
+            P = st.pit
+            H, W = P.shape
+            Lh = np.zeros((H, W), dtype=np.int16)
+            Lv = np.zeros((H, W), dtype=np.int16)
+            for y in range(H):
+                x = 0
+                row = P[y]
+                while x < W:
+                    if row[x]:
+                        x2 = x
+                        while x2 < W and row[x2]:
+                            x2 += 1
+                        Lh[y, x:x2] = x2 - x
+                        x = x2
+                    else:
+                        x += 1
+            for x in range(W):
+                y = 0
+                col = P[:, x]
+                while y < H:
+                    if col[y]:
+                        y2 = y
+                        while y2 < H and col[y2]:
+                            y2 += 1
+                        Lv[y:y2, x] = y2 - y
+                        y = y2
+                    else:
+                        y += 1
+            self._pit_runs = cache = (key, Lh, Lv)
+        return st.pit & (np.minimum(cache[1], cache[2]) <= lmax)
+
     def _do_step(self, c, nx: int, ny: int, cost: int, kind: str | None = None) -> None:
         m = self.map
         ts = c.ts
         frm = (c.x, c.y, c.z)
         frm_cells = c.cells()
         old_xy = (c.x, c.y)
+        run = c.fstate.get("run")
+        ddx, ddy = (nx > old_xy[0]) - (nx < old_xy[0]), (ny > old_xy[1]) - (ny < old_xy[1])
+        tk = (self.round, self.active)
+        if run and run.get("d") == (ddx, ddy) and run.get("t") == tk:
+            c.fstate["run"] = {"d": (ddx, ddy), "n": run["n"] + max(abs(nx - old_xy[0]), abs(ny - old_xy[1])), "t": tk}
+        else:
+            c.fstate["run"] = {"d": (ddx, ddy), "n": max(abs(nx - old_xy[0]), abs(ny - old_xy[1])), "t": tk}
         m.unplace(c)
         c.x, c.y = nx, ny
         self._place_keep_others(c)
@@ -1750,8 +2216,10 @@ class _Movement(_Vision):
         ts.moved_sq += 1
         if nx != old_xy[0] and ny != old_xy[1]:
             ts.diag_moves += 1
-        mode = kind or ("fly" if c.z > 0 else ("crawl" if c.cond_mask >> Condition.PRONE & 1 else
-                                                ("swim" if m.static.water[ny, nx] and c.speeds.get("swim") else "walk")))
+        mode = kind or ("fly" if c.z > 0 else "burrow" if c.z < 0 else ("crawl" if c.cond_mask >> Condition.PRONE & 1 else
+                                                ("swim" if m.static.water[ny, nx] and c.speeds.get("swim") else
+                                                 "climb" if m.static.climbable[ny, nx] and c.speeds.get("climb") else
+                                                 "walk")))
         self.emit(ET.MOVE, c.eid, -1, cost, _KIND[mode], {"frm": frm, "to": (nx, ny, c.z)})
         c.stat("squares")
         if c.grappling:
@@ -1768,12 +2236,15 @@ class _Movement(_Vision):
             Z.trigger_enter(self, c, frm_cells)
             if not c.present or c.status & S.DEAD:
                 return
+        self.refresh_move_flags(c)
         self._after_arrival(c)
         self._check_readied(c)
+        if c.rider >= 0 and c.present:
+            self._carry_rider(c)
 
     def _place_keep_others(self, c) -> None:
         m = self.map
-        if c.z > 0:
+        if c.z != 0:
             m.air[c.eid] = c.z
             return
         s = c.size_sq
@@ -1905,10 +2376,13 @@ class _Movement(_Vision):
             if h.avoids_opportunity(self, c, (nx, ny)):
                 return
         sz = c.size_sq
+        cf = c.faction
+        col = self.relations[:, cf].tolist()               # relation(h, c) is read from relations[h.faction, c.faction]
         for h in self.creatures:
-            if h is c or not h.present or not h.reaction_available or h.status & (S.DEAD | S.SURPRISED):
+            if h is c or h.faction == cf or col[h.faction] != 0 or not h.present or not h.reaction_available \
+                    or h.status & (S.DEAD | S.SURPRISED):
                 continue
-            if h.cond_mask & INCAP_MASK or self.relation(h.eid, c.eid) != Relation.HOSTILE:
+            if h.cond_mask & INCAP_MASK:
                 continue
             reach = self.reach_of(h)
             d0 = self.distance(h.eid, c.eid)
@@ -1921,17 +2395,21 @@ class _Movement(_Vision):
                 continue
             if not R.can_react(h) or not self.sees(h.eid, c.eid):
                 continue
-            ab = self.best_attack(h, c, melee_only=True)
+            tgt = self._mount_oa_target(h, c) if c.rider >= 0 else c      # mount or rider: the attacker's choice
+            ab = self.best_attack(h, tgt, melee_only=True)
+            if ab is None and tgt is not c:
+                tgt = c
+                ab = self.best_attack(h, tgt, melee_only=True)
             if ab is None:
                 continue
             opts = [DecisionOption("attack", "Opportunity attack", {"ability": ab.id})]
-            i = decide(self, h.eid, DecisionKind.OPPORTUNITY_ATTACK, opts, {"target": c.eid, "to": (nx, ny)})
+            i = decide(self, h.eid, DecisionKind.OPPORTUNITY_ATTACK, opts, {"target": tgt.eid, "to": (nx, ny)})
             if i <= 0:
                 continue
             h.reaction_available = False
-            self.emit(ET.REACTION, h.eid, c.eid, 0, int(DecisionKind.OPPORTUNITY_ATTACK),
+            self.emit(ET.REACTION, h.eid, tgt.eid, 0, int(DecisionKind.OPPORTUNITY_ATTACK),
                       {"ability": ab.id, "name": "Opportunity Attack"})
-            self.free_attack(h, ab, c)
+            self.free_attack(h, ab, tgt)
             self._interrupt = True
             if not c.present or c.status & S.DEAD or c.cond_mask & INCAP_MASK:
                 return
@@ -1985,11 +2463,61 @@ class _Movement(_Vision):
             self.free_attack(r, ab, mover)
 
     # ------------------------------------------------------------------ altitude, falling, forced moves
+    def _can_burrow_down(self, c) -> bool:
+        """May ``c`` dig into the ground where it stands?"""
+        return c.z == 0 and c.speeds.get("burrow", 0) > 0 and \
+            self._burrow_cells_ok(c, c.x, c.y) and not c.grappling
+
+    def _can_emerge(self, c) -> bool:
+        m = self.map
+        s = c.size_sq
+        if m.blocked[c.y:c.y + s, c.x:c.x + s].any() or m.static.lava[c.y:c.y + s, c.x:c.x + s].any():
+            return False
+        return self._footprint_free_ground(c)
+
     def _act_altitude(self, c, dz: int) -> bool:
+        if c.mount >= 0:                                   # mounted: the flying mount climbs / dives
+            m = self._steed(c)
+            if m is None or c.cond_mask & INCAP_MASK:
+                return False
+            ok = self._act_altitude(m, dz)
+            self._mounted_move_done(c, m)
+            return ok
+        ok = self._act_altitude_inner(c, dz)
+        if ok and c.rider >= 0:
+            self._carry_rider(c)
+        return ok
+
+    def _act_altitude_inner(self, c, dz: int) -> bool:
         ts = c.ts
         if c.cond_mask & INCAP_MASK or ts.movement_left < 5:
             return False
         fly = c.speeds.get("fly", 0)
+        if c.z < 0 or (c.z == 0 and dz < 0):             # burrowing: dig in (descend at z=0) / emerge (ascend at z<0)
+            if R.base_speed(self, c) <= 0 or c.speeds.get("burrow", 0) <= 0:
+                return False
+            if c.z == 0:
+                if not self._can_burrow_down(c):
+                    return False
+                nz = -1
+            else:
+                if dz < 0:
+                    return False
+                if not self._can_emerge(c):
+                    return False
+                nz = 0
+            frm = (c.x, c.y, c.z)
+            self.map.unplace(c)
+            c.z = nz
+            self.map.place(c)
+            ts.movement_left -= 5
+            self.emit(ET.MOVE, c.eid, -1, 5, 5, {"frm": frm, "to": (c.x, c.y, c.z)})
+            self.vis_dirty()
+            self.refresh_move_flags(c)
+            c.touch()
+            if nz == 0:
+                self._after_arrival(c)
+            return True
         if not fly or R.base_speed(self, c) <= 0:
             return False
         nz = c.z + dz
@@ -2062,8 +2590,189 @@ class _Movement(_Vision):
         finally:
             self._fall_height = 0
 
+    # ------------------------------------------------------------------ mounted combat (SRD: Mounted Combat)
+    def _steed(self, c):
+        """The creature that moves when ``c`` is told to move: ``c`` itself, its controlled mount while mounted, or
+        None when ``c`` rides an independent mount (the rider cannot move on its own)."""
+        if c.mount < 0:
+            return c
+        m = self.entities[c.mount]
+        return m if m.mount_controlled and m.present else None
+
+    def mount_cost(self, rider) -> int:
+        """Movement (ft) that mounting or dismounting costs: half the rider's speed."""
+        return R.base_speed(self, rider) // 2
+
+    def mount_valid(self, rider, mount, check_cost: bool = True) -> bool:
+        """May ``rider`` climb onto ``mount`` right now?  The mount must be a willing (allied), conscious creature
+        with the ``mount`` tag that is at least one size larger, unburdened by another rider, and within 5 ft."""
+        if not self.rules.mounts or rider is mount or rider.kind != EntityKind.CREATURE or \
+                mount.kind != EntityKind.CREATURE:
+            return False
+        if rider.mount >= 0 or rider.rider >= 0 or mount.mount >= 0 or mount.rider >= 0:
+            return False
+        if not (rider.present and mount.present) or (rider.status | mount.status) & (S.DEAD | S.DYING | S.STABLE):
+            return False
+        if "mount" not in mount.tags or "mount" in rider.tags or int(mount.size) < int(rider.size) + 1:
+            return False
+        if (rider.cond_mask | mount.cond_mask) & INCAP_MASK:
+            return False
+        if self.relation(rider.eid, mount.eid) != Relation.ALLIED:
+            return False
+        if rider.z != mount.z or self.distance(rider.eid, mount.eid) > 1:
+            return False
+        if check_cost and rider.ts.movement_left < self.mount_cost(rider):
+            return False
+        return True
+
+    def mount_candidates(self, rider) -> list:
+        """Creatures ``rider`` could mount right now (adjacent, willing, big enough), nearest first."""
+        if not self.rules.mounts or rider.mount >= 0 or self._mount_count == 0:
+            return []
+        out = [m for m in self.creatures if m.present and "mount" in m.tags and self.mount_valid(rider, m)]
+        out.sort(key=lambda m: (self.distance(rider.eid, m.eid), m.eid))
+        return out
+
+    def mount_up(self, rider, mount, free: bool = False) -> bool:
+        """Rider mounts ``mount`` (costs half the rider's speed unless ``free``).  The rider shares the mount's
+        space; a controlled mount's turn is merged into the rider's (it moves on the rider's MOVE/APPROACH and spends
+        its own movement), an independent mount keeps its own initiative and AI."""
+        if not self.mount_valid(rider, mount, check_cost=not free):
+            return False
+        if not free:
+            rider.ts.movement_left -= self.mount_cost(rider)
+        self.map.unplace(rider)
+        rider.mount = mount.eid
+        mount.rider = rider.eid
+        mount.mount_controlled = "mount_independent" not in mount.tags
+        rider.mount_controlled = mount.mount_controlled
+        self._n_riders += 1
+        rider.x, rider.y, rider.z = mount.x, mount.y, mount.z
+        own = rider.ts.movement_left
+        rider.fstate["mount"] = {"own": own}
+        if mount.mount_controlled and self.active == rider.eid:
+            mount.ts.reset(R.base_speed(self, mount))
+            rider.ts.movement_left = mount.ts.movement_left
+        self.emit(ET.MOUNT, rider.eid, mount.eid, 0, -1, {"free": bool(free)})
+        self.refresh_move_flags(rider)
+        self.refresh_move_flags(mount)
+        rider.touch()
+        mount.touch()
+        self.vis_dirty()
+        return True
+
+    def dismount(self, rider, free: bool = False, prone: bool = False, reason: str = "voluntary") -> bool:
+        """End the ride: the rider lands in a free square next to the mount (prone when ``prone``).  Voluntary
+        dismounting costs half the rider's speed unless ``free``."""
+        if rider.mount < 0:
+            return False
+        mount = self.entities[rider.mount]
+        own = int(rider.fstate.get("mount", {}).get("own", rider.ts.movement_left))
+        if not free:
+            if mount.mount_controlled and self.active == rider.eid:
+                pass
+            if own < self.mount_cost(rider):
+                return False
+            own -= self.mount_cost(rider)
+        rider.mount = -1
+        mount.rider = -1
+        self._n_riders = max(0, self._n_riders - 1)
+        rider.fstate.pop("mount", None)
+        rider.x, rider.y, rider.z = mount.x, mount.y, mount.z
+        x, y = self._find_free(rider, mount.x, mount.y)
+        rider.x, rider.y = x, y
+        if mount.z > 0 and rider.speeds.get("fly", 0) <= 0 and not rider.hover:
+            rider.z = mount.z
+        self.map.place(rider)
+        if self.active == rider.eid:
+            rider.ts.movement_left = max(0, own)
+        self.emit(ET.DISMOUNT, rider.eid, mount.eid, 0, -1, {"reason": reason, "prone": bool(prone)})
+        self.refresh_move_flags(rider)
+        self.refresh_move_flags(mount)
+        rider.touch()
+        mount.touch()
+        self.vis_dirty()
+        if prone and rider.present and not rider.status & S.DEAD:
+            R.add_condition(self, rider, Condition.PRONE, source=-1)
+        if rider.z > 0 and rider.speeds.get("fly", 0) <= 0 and not rider.hover:
+            self.fall(rider)
+        self._after_arrival(rider)
+        return True
+
+    def mount_fall(self, rider, reason: str, save: bool = False) -> bool:
+        """Forced off the mount: with ``save`` a DEX save (DC 10) keeps the rider seated.  When the mount is knocked
+        prone a rider with a reaction may step off and land on its feet.  Returns True when the rider came off."""
+        if rider.mount < 0:
+            return False
+        if save and R.saving_throw(self, rider, Ability.DEX, 10, -1, name="mounted"):
+            return False
+        feet = reason == "mount_prone" and rider.reaction_available and R.can_react(rider)
+        if feet:
+            rider.reaction_available = False
+        return self.dismount(rider, free=True, prone=not feet, reason=reason)
+
+    def _carry_rider(self, mount, frm_cells=None) -> None:
+        """Move the rider with its mount (called after any displacement of the mount)."""
+        r = self.entities[mount.rider]
+        if (r.x, r.y, r.z) == (mount.x, mount.y, mount.z):
+            return
+        frm = (r.x, r.y, r.z)
+        cells = r.cells()
+        r.x, r.y, r.z = mount.x, mount.y, mount.z
+        r.speed_cache = None
+        self.emit(ET.MOVE, r.eid, -1, 0, 0, {"frm": frm, "to": (r.x, r.y, r.z), "mounted": True})
+        if r.light is not None:
+            self.map.light_version += 1
+        if r.status & S.HIDDEN:
+            self.reveal(r, "mounted")
+        if self.zones:
+            Z.reanchor_emanations(self, r)
+            Z.trigger_enter(self, r, cells)
+        self._after_arrival(r)
+
+    def _sync_riders(self) -> None:
+        for r in self.creatures:
+            if r.mount >= 0 and r.present:
+                m = self.entities[r.mount]
+                if not m.present:
+                    self.dismount(r, free=True, prone=True, reason="mount_down")
+                elif (r.x, r.y, r.z) != (m.x, m.y, m.z):
+                    self._carry_rider(m)
+
+    def _mount_oa_target(self, attacker, mover):
+        """Opportunity attacks against a mount that carries a rider: the attacker picks the weaker of the two."""
+        if mover.rider < 0:
+            return mover
+        r = self.entities[mover.rider]
+        if not r.present or r.status & S.DEAD or not self.sees(attacker.eid, r.eid):
+            return mover
+        a = (mover.hp + mover.temp_hp, R.compute_ac(self, mover))
+        b = (r.hp + r.temp_hp, R.compute_ac(self, r))
+        return r if b < a else mover
+
+    def _mount_turn_start(self, rider) -> None:
+        """A rider's turn begins: its own movement is parked, a controlled mount's fresh speed becomes the pool."""
+        m = self.entities[rider.mount]
+        rider.fstate.setdefault("mount", {})["own"] = rider.ts.movement_left
+        if m.mount_controlled and m.present:
+            m.ts.reset(R.base_speed(self, m) if not rider.status & S.SURPRISED else 0)
+            m.reaction_available = not rider.status & S.SURPRISED
+            m.status &= ~int(S.DODGING | S.DISENGAGED | S.SURPRISED)     # it shares the rider's surprise
+            if rider.status & S.SURPRISED:
+                m.status |= int(S.SURPRISED)
+            rider.ts.movement_left = m.ts.movement_left
+        else:
+            rider.ts.movement_left = 0                         # an independent mount carries the rider
+
+    def _mounted_move_done(self, rider, mount) -> None:
+        """After the steed moved on the rider's command: mirror the movement pool."""
+        rider.ts.movement_left = mount.ts.movement_left
+        rider.ts.moved_sq = mount.ts.moved_sq
+
     def forced_move(self, t, dx: int, dy: int, n: int, src: int = -1) -> int:
         """Push ``t`` up to ``n`` squares along (dx, dy) without provoking. Returns squares moved."""
+        if t.mount >= 0 and t.kind == EntityKind.CREATURE:          # a pushed rider is pulled off its mount
+            self.dismount(t, free=True, reason="forced")
         moved = 0
         frm = (t.x, t.y, t.z)
         frm_cells = t.cells()
@@ -2087,6 +2796,7 @@ class _Movement(_Vision):
             moved += 1
         if moved:
             self.emit(ET.FORCED_MOVE, src, t.eid, moved, -1, {"frm": frm, "to": (t.x, t.y)})
+            self.refresh_move_flags(t)
             self.vis_dirty()
             if t.light is not None:
                 self.map.light_version += 1
@@ -2095,6 +2805,9 @@ class _Movement(_Vision):
                 Z.trigger_enter(self, t, frm_cells)
             self._after_arrival(t)
             self._check_readied(t)
+            if t.rider >= 0 and t.present:                           # moved against its will: DEX save DC 10 or thrown
+                self._carry_rider(t)
+                self.mount_fall(self.entities[t.rider], "forced", save=True)
         return moved
 
     def _pit_ahead(self, t, dx, dy) -> bool:
@@ -2117,12 +2830,15 @@ class _Movement(_Vision):
         """Instantly move ``c`` to (x, y) if the footprint is free (no OAs; ends grapples)."""
         if not self._footprint_free(c, x, y):
             return False
+        if c.mount >= 0:
+            self.dismount(c, free=True, reason="forced")
         frm = (c.x, c.y, c.z)
         frm_cells = c.cells()
         self.map.unplace(c)
         c.x, c.y = x, y
         self.map.place(c)
         self.emit(ET.TELEPORT, c.eid, -1, 0, -1, {"frm": frm, "to": (x, y, c.z), "spell": spell})
+        self.refresh_move_flags(c)
         R.remove_condition(self, c, Condition.GRAPPLED)
         self.vis_dirty()
         if c.light is not None:
@@ -2132,12 +2848,16 @@ class _Movement(_Vision):
             Z.trigger_enter(self, c, frm_cells)
         self._after_arrival(c)
         self._check_readied(c)
+        if c.rider >= 0 and c.present:
+            self._carry_rider(c)
+            self.mount_fall(self.entities[c.rider], "forced", save=True)
         return True
 
     # ------------------------------------------------------------------ approach macro
-    def _approach_goal(self, c, t):
+    def _approach_goal(self, c, t, reach=None):
         """Cells adjacent (within best reach) to target footprint."""
-        reach = self.reach_of(c)
+        if reach is None:
+            reach = self.reach_of(c)
         tsz = t.size_sq if t.kind == EntityKind.CREATURE else 1
         m = self.map
         goals = []
@@ -2154,10 +2874,32 @@ class _Movement(_Vision):
     def _approach_cost(self, c):
         """Path costs (feet) for ``c``: terrain grid + prone/drag surcharge, hostile creatures impassable."""
         m = self.map
-        mode = "fly" if c.z > 0 else ("swim" if c.speeds.get("swim") else "walk")
+        if c.z < 0:
+            mode = "burrow_rock" if self._burrow_rock(c) else "burrow"
+            return m.cost_grid(mode, c.size_sq) * np.float32(5.0 * self._burrow_ratio(c))
+        mode = "fly" if c.z > 0 else (("swim" if c.speeds.get("swim") else "") +
+                                      ("climb" if c.speeds.get("climb") else "") or "walk")
         if mode != "fly" and R.hooks(c, "ignores_difficult"):
             mode = "nodiff"
-        cost = m.cost_grid(mode, c.size_sq) * np.float32(5.0)
+        s = c.size_sq
+        cost = m.cost_grid(mode, s) * np.float32(5.0)
+        jp = self._jumpable_pits(c) if c.z == 0 and mode != "fly" else None
+        if jp is not None and jp.any():
+            cost = cost.copy()
+            cost[jp] = np.float32(5.0)                            # narrow chasms can be jumped
+        if c.z == 0 and self._phases(c):
+            cost = cost.copy()                                   # walls and doors are difficult terrain for it
+            cost[(m.static.solid_rock | m.door_closed) & m.blocked] = np.float32(10.0)
+        elif c.z == 0 and s > 1:
+            csm = m.cost_grid(mode, s - 1)                        # squeeze: a free (s-1)-square anchor, double cost
+            sq = ~np.isfinite(cost) & np.isfinite(csm)
+            if sq.any():
+                H, W = sq.shape
+                sq[max(0, H - s + 1):, :] = False
+                sq[:, max(0, W - s + 1):] = False
+                sq &= ~self._squeeze_blockers(s)
+                cost = cost.copy()
+                cost[sq] = csm[sq] * np.float32(5.0 if self._free_squeeze(c) else 10.0)
         add = (1 if c.cond_mask >> 10 & 1 else 0) + (1 if c.grappling and self._drag_penalty(c) else 0)
         if add:
             cost += np.float32(5 * add)
@@ -2166,7 +2908,9 @@ class _Movement(_Vision):
                        if o is not c and o.present and o.z == 0 and self.relation(c.eid, o.eid) == Relation.HOSTILE
                        and not self._enter_ok(c, o, True)]
             if hostile:
-                hm = np.isin(m.occ, hostile)
+                lut = np.zeros(len(self.entities) + 1, bool)       # occ == -1 indexes the trailing False
+                lut[hostile] = True
+                hm = lut[m.occ]
                 if c.size_sq > 1:
                     hm = geo.inflate_blocked(hm, c.size_sq)
                 cost[hm] = np.inf
@@ -2178,34 +2922,52 @@ class _Movement(_Vision):
         t = self.entities[tid]
         if not t.present:
             return False
+        rider = c
+        if c.mount >= 0:                                   # mounted: the controlled mount walks, the rider's reach counts
+            c = self._steed(rider)
+            if c is None or tid == c.eid or rider.cond_mask & INCAP_MASK or rider.status & S.SURPRISED:
+                return False
         ts = c.ts
         if ts.movement_left < 5 or R.base_speed(self, c) <= 0 or c.cond_mask & INCAP_MASK:
             return False
-        reach = self.reach_of(c)
-        if self.distance(c.eid, tid) <= reach:
+        reach = self.reach_of(rider)
+        if self.distance(rider.eid, tid) <= reach:
             return False
-        if t.kind == EntityKind.CREATURE and not self.sees(c.eid, tid) and \
-                self.relation(c.eid, tid) == Relation.HOSTILE and tid not in c.aware:
+        if t.kind == EntityKind.CREATURE and not self.sees(rider.eid, tid) and \
+                self.relation(rider.eid, tid) == Relation.HOSTILE and tid not in rider.aware:
             return False
-        path = self._approach_path(c, t)
+        path = self._approach_path(c, t, reach=reach)
         if path is None or len(path) == 0:
             return False
         self._interrupt = False
         start_mode_pending = self._combat_pending
         moved = 0
+        skip_to = None                                     # after a jump: path squares up to the landing are behind us
         for (px, py) in path:
+            if skip_to is not None:
+                if max(abs(px - c.x), abs(py - c.y)) == 1 and not self.map.static.pit[py, px]:
+                    skip_to = None                          # first square after the landing: carry on from here
+                else:
+                    continue
             dx, dy = px - c.x, py - c.y
             if max(abs(dx), abs(dy)) != 1:
                 break
+            ox, oy = c.x, c.y
             if not self.try_step(c, dx, dy, pass_allies=True):
                 break
+            if max(abs(c.x - ox), abs(c.y - oy)) > 1:
+                skip_to = True
             moved += 1
             stop = self._interrupt or not c.present or c.status & S.DEAD or c.cond_mask & INCAP_MASK \
-                or (self._combat_pending and not start_mode_pending) or self.distance(c.eid, tid) <= reach
+                or (self._combat_pending and not start_mode_pending) or self.distance(rider.eid, tid) <= reach
             if stop and not (c.present and self._standing_on_other(c)):
                 break
         if c.present and self._standing_on_other(c):
             self._displace(c)
+            if c.rider >= 0:
+                self._carry_rider(c)
+        if rider is not c:
+            self._mounted_move_done(rider, c)
         return moved > 0
 
     def _displace(self, c) -> None:
@@ -2213,6 +2975,7 @@ class _Movement(_Vision):
         self.map.unplace(c)
         c.x, c.y = self._find_free(c, c.x, c.y)
         self.map.place(c)
+        self.refresh_move_flags(c)
         self.vis_dirty()
 
     def _cell_free_for(self, c, x: int, y: int) -> bool:
@@ -2241,10 +3004,27 @@ class _Movement(_Vision):
                     return True
         return False
 
-    def _approach_path(self, c, t, cost=None, dist=None):
+    def _approach_field(self, c):
+        """``(cost grid, Dijkstra field)`` of ``c``'s approach planning, memoised per engine state (mover cell / size /
+        conditions, every creature's version, occupancy, vision epoch, map movement version, zones)."""
+        m = self.map
+        key = (c.x, c.y, c.z, c.size_sq, c.cond_mask, c.version, len(c.grappling), c.mount, self._vis_epoch,
+               m.move_version, m.occ.tobytes(), self.rules.diagonal_rule, tuple(map(id, self.zones)),
+               tuple([o.version for o in self.creatures]))
+        hit = self._af_cache.get(c.eid)
+        if hit is not None and hit[0] == key:
+            return hit[1], hit[2]
+        cost = self._approach_cost(c)
+        dist = geo.dijkstra(cost, c.x, c.y, 1e6, 1 if self.rules.diagonal_rule == "5-10-5" else 0)
+        self._af_cache[c.eid] = (key, cost, dist)
+        return cost, dist
+
+    def _approach_path(self, c, t, cost=None, dist=None, reach=None):
+        if cost is None and dist is None:
+            cost, dist = self._approach_field(c)
         if cost is None:
             cost = self._approach_cost(c)
-        goals = self._approach_goal(c, t)
+        goals = self._approach_goal(c, t, reach)
         if not goals:
             return None
         occ = self.map.occ
@@ -2305,6 +3085,7 @@ class _Social(_Movement):
         """Add an ItemInstance to ``c`` (stacking identical stackables). ``None`` is ignored."""
         if it is None:
             return
+        it.attuned = False if self.rules.attunement else getattr(it.def_, "attunement", False)
         d = it.def_
         stackable = getattr(d, "consumable", False) or getattr(d, "kind", "") in ("ammo", "gem", "potion", "scroll") \
             or getattr(d, "category", None) is not None and False
@@ -2353,6 +3134,7 @@ class _Social(_Movement):
             return
         part = it.copy()
         part.qty = n
+        part.attuned = False
         self.consume_item(c, it, n)
         for k, v in list(c.equipped.items()):
             if v is it:
@@ -2514,6 +3296,16 @@ class _Social(_Movement):
 
     # ------------------------------------------------------------------ removal / death
     def remove_from_play(self, c, dead=False, escaped=False, fell=False) -> None:
+        if c.rider >= 0:                                  # the mount is gone: the rider falls off prone
+            self.dismount(self.entities[c.rider], free=True, prone=True, reason="mount_down")
+        elif c.mount >= 0:
+            m = self.entities[c.mount]
+            m.rider = -1
+            c.mount = -1
+            self._n_riders = max(0, self._n_riders - 1)
+            c.fstate.pop("mount", None)
+            self.refresh_move_flags(m)
+            self.refresh_move_flags(c)
         self.map.unplace(c)
         c.present = False
         self.readied.pop(c.eid, None)
@@ -2575,8 +3367,8 @@ class _Social(_Movement):
 
     def parley(self, c, t) -> None:
         dc = self.parley_dc(c, t)
-        r1 = R.ability_check(self, c, Skill.PERSUASION, dc, emit=False, purpose="parley")
-        r2 = R.ability_check(self, c, Skill.INTIMIDATION, dc, emit=False, purpose="parley")
+        r1 = R.ability_check(self, c, Skill.PERSUASION, dc, emit=False, purpose="parley", target=t)
+        r2 = R.ability_check(self, c, Skill.INTIMIDATION, dc, emit=False, purpose="parley", target=t)
         total, ok, roll = max(r1, r2, key=lambda r: r[0])
         self.emit(ET.PARLEY, c.eid, t.eid, 0, -1, {"success": ok, "dc": dc, "roll": roll, "total": total})
         if ok:
@@ -2633,13 +3425,18 @@ class _Social(_Movement):
             self.short_rest(members)
 
     def short_rest(self, members) -> None:
-        """Short rest (SRD: Resting): spend hit dice, recharge short-rest resources, pass time."""
+        """Short rest (SRD: Resting): spend hit dice, recharge short-rest resources, attune to items, pass time."""
         self.emit(ET.REST, -1, -1, 0, -1, {"kind": "short", "participants": [m.eid for m in members]})
         for c in members:
             while c.hp < c.max_hp * 0.5 and c.hit_dice_left > 0:
                 c.hit_dice_left -= 1
-                amt = max(1, D.roll_die(self.rng, c.hit_die) + c.mods[2])
+                die = self._spend_hit_die(c)
+                amt = max(1, D.roll_die(self.rng, die) + c.mods[2])
                 R.heal(self, None, c, amt, "hit_die")
+                for o in self.creatures_with_hook("observe_hit_die"):
+                    if o.present and not o.status & S.DEAD:
+                        for h in R.hooks(o, "observe_hit_die"):
+                            h.observe_hit_die(self, c, amt)
             for rid, rd in c.resource_def.items():
                 if rd.recharge in ("short", "turn", "round"):
                     c.resources[rid] = c.resource_max.get(rid, 0)
@@ -2648,12 +3445,36 @@ class _Social(_Movement):
             c.uses_left = {k: v for k, v in c.uses_left.items() if False}
             for h in R.hooks(c, "on_short_rest"):
                 h.on_short_rest(self, c)
+            if self.rules.attunement and self.auto_attune(c):      # attunement takes a short rest (SRD)
+                self.sync_items(c)
             c.rest_vote = False
             c.touch()
         self._advance_time(self.rules.short_rest_rounds)
         ch = self.rules.wandering_monster_chance
         if ch > 0 and self.rules.wandering_monster_ids and self.rng.random() < ch:
             self._spawn_wanderers(members)
+
+    @staticmethod
+    def _spend_hit_die(c) -> int:
+        """Die size spent for one hit die (multiclass: the largest die still available)."""
+        left = c.fstate.get("hd_left")
+        if left:
+            for die in sorted(left, reverse=True):
+                if left[die] > 0:
+                    left[die] -= 1
+                    return die
+        return c.hit_die
+
+    @staticmethod
+    def _regain_hit_dice(c, n: int) -> None:
+        mx = c.fstate.get("hd_max")
+        left = c.fstate.get("hd_left")
+        if mx and left is not None:
+            for die in sorted(mx, reverse=True):
+                add = min(n, mx[die] - left.get(die, 0))
+                if add > 0:
+                    left[die] = left.get(die, 0) + add
+                    n -= add
 
     def long_rest(self, members=None) -> None:
         """Long rest for the given (default: all present) creatures."""
@@ -2662,7 +3483,12 @@ class _Social(_Movement):
                 continue
             c.hp = c.max_hp
             c.temp_hp = 0
-            c.hit_dice_left = min(c.hit_dice_max, c.hit_dice_left + max(1, c.hit_dice_max // 2))
+            regained = max(1, c.hit_dice_max // 2)
+            if c.fstate.get("hd_max"):
+                self._regain_hit_dice(c, regained)
+                c.hit_dice_left = sum(c.fstate["hd_left"].values())
+            else:
+                c.hit_dice_left = min(c.hit_dice_max, c.hit_dice_left + regained)
             c.spell_slots = list(c.spell_slots_max)
             c.pact_slots = c.pact_max
             for rid in c.resource_def:
@@ -2701,6 +3527,23 @@ class _Social(_Movement):
                 if z.remaining <= 0:
                     Z.remove_zone(self, z, "expired")
         self.elapsed_rounds = getattr(self, "elapsed_rounds", 0) + rounds
+        self._stable_recovery(rounds)
+
+    def _stable_recovery(self, rounds: int) -> None:
+        """SRD: a stable creature that is not healed regains 1 hit point after 1d4 hours (600 rounds each).  The clock
+        starts at the first time-passing event (rest) after it stabilised and is dropped when it stops being stable."""
+        for c in self.creatures:
+            clock = c.fstate.get("stable_clock")
+            if not (c.present and c.status & S.STABLE and not c.status & S.DEAD):
+                if clock is not None:
+                    c.fstate.pop("stable_clock", None)
+                continue
+            if clock is None:
+                clock = c.fstate["stable_clock"] = {"left": 600 * (1 + int(self.rng.integers(0, 4)))}
+            clock["left"] -= rounds
+            if clock["left"] <= 0:
+                c.fstate.pop("stable_clock", None)
+                R.heal(self, None, c, 1, "stable_recovery")
 
     def _spawn_wanderers(self, members) -> None:
         from emberdeep.core.factory import lookup_monster, make_monster
@@ -2734,9 +3577,9 @@ class World(_Social):
     # ------------------------------------------------------------------ abilities & masks
     def abilities(self, eid: int) -> list:
         """The creature's runtime ability list (26 universal + up to 24 specific)."""
-        c = self.entities[eid]
-        cache = c.ab_cache
+        cache = self.entities[eid].ab_cache
         if cache is None:
+            c = self.entities[eid]
             cache = AB.build_abilities(self, c)
             c.ab_cache = cache
         return cache[0]
@@ -2748,6 +3591,11 @@ class World(_Social):
         return c.ab_cache[1]
 
     def ability_mask(self, eid: int) -> np.ndarray:
+        """[n_abilities] bool: which abilities are usable now (economy-gated fast path; equals :meth:`ability_mask_ref`)."""
+        return FM.ability_mask(self, eid)
+
+    def ability_mask_ref(self, eid: int) -> np.ndarray:
+        """Reference implementation (calls ``usable`` for every ability); kept for differential tests."""
         abil = self.abilities(eid)
         out = np.zeros(len(abil), dtype=bool)
         if eid != self.active or self.pending_decision is not None or self.done:
@@ -2762,8 +3610,36 @@ class World(_Social):
                 log.exception("usable() failed for %s", ab.id)
         return out
 
+    def ability_usable(self, eid: int, k: int) -> bool:
+        """``ability_mask(eid)[k]`` evaluated for the single ability ``k`` (the AI usually needs 3 of ~30)."""
+        abil = self.abilities(eid)
+        if k < 0 or k >= len(abil):
+            return False
+        if eid != self.active or self.pending_decision is not None or self.done:
+            return False
+        c = self.entities[eid]
+        if not c.present:
+            return False
+        info = FM.ab_info(c, abil)
+        g = info.gate[k]
+        if g >= 0 and FM.economy_modes(self, c)[g] == 0:
+            return False
+        try:
+            return bool(abil[k].usable(self, c))
+        except Exception:  # noqa: BLE001
+            log.exception("usable() failed for %s", abil[k].id)
+            return False
+
     def target_mask(self, eid: int, k: int, cand_eids, cand_points) -> np.ndarray:
-        """Validity of each candidate entity and point target for ability ``k``."""
+        """Validity of each candidate entity and point target for ability ``k`` (equals :meth:`target_mask_ref`)."""
+        return FM.target_masks(self, eid, (k,), cand_eids, cand_points)[0]
+
+    def target_mask_many(self, eid: int, ks, cand_eids, cand_points) -> np.ndarray:
+        """``[len(ks), n + P]`` bool: :meth:`target_mask` for several abilities at once (shares the distance table)."""
+        return FM.target_masks(self, eid, ks, cand_eids, cand_points)
+
+    def target_mask_ref(self, eid: int, k: int, cand_eids, cand_points) -> np.ndarray:
+        """Reference implementation (one predicate call per candidate); kept for differential tests."""
         abil = self.abilities(eid)
         c = self.entities[eid]
         n = len(cand_eids)
@@ -2802,7 +3678,74 @@ class World(_Social):
         return out
 
     def move_mask(self, eid: int) -> np.ndarray:
-        """[10] bool: 8 directions, ascend, descend."""
+        """[10] bool: 8 directions, ascend, descend.  Memoised per (creature state, vision epoch, map movement version,
+        occupancy); equals :meth:`move_mask_ref`."""
+        c = self.entities[eid]
+        if eid != self.active or self.pending_decision is not None or self.done or not c.present:
+            return np.zeros(10, dtype=bool)
+        ts = c.ts
+        m = self.map
+        mv = c
+        if c.mount >= 0:
+            mv = self._steed(c)
+            if mv is None:
+                return self.move_mask_ref(eid)
+        key = (c.x, c.y, c.z, c.size_sq, ts.movement_left, c.cond_mask, c.status, c.version, c.mount, c.faction,
+               self._vis_epoch, m.move_version, m.occ.tobytes(), tuple(c.grappling), ts.diag_moves,
+               mv.x, mv.y, mv.z, mv.ts.movement_left, mv.cond_mask, mv.version, len(self.zones),
+               tuple(map(id, self.zones)) if self.zones else (), len(m.air))
+        cache = self._mm_cache
+        hit = cache.get(eid)
+        if hit is not None and hit[0] == key:
+            return hit[1].copy()
+        out = self._move_mask_fast(c)
+        if out is None:
+            out = self.move_mask_ref(eid)
+        cache[eid] = (key, out.copy())
+        return out
+
+    def _move_mask_fast(self, c):
+        """``move_mask_ref`` for a size-1 ground walker with no zones / grappling / terrain hooks (Numba step costs); ``None``
+        when the creature does not qualify."""
+        mv = c
+        if (c.mount >= 0 or c.size_sq != 1 or c.z != 0 or c.grappling or c.kind != 0
+                or self.rules.diagonal_rule != "chebyshev"):
+            return None
+        zones = self.zones
+        if zones and any(z.params.get("half_speed") for z in zones):
+            return None
+        spd = c.speeds
+        if spd.get("fly", 0) or spd.get("burrow", 0) or "incorporeal_movement" in c.trait_ids:
+            return None
+        if R.hooks(c, "ignores_difficult"):
+            return None
+        out = np.zeros(10, dtype=bool)
+        ts = c.ts
+        if c.cond_mask & INCAP_MASK or c.status & S.SURPRISED or ts.movement_left < 5 or R.base_speed(self, c) <= 0:
+            return out
+        m = self.map
+        st = m.static
+        costs = self._mm_costs
+        FK.walker_step_costs(m.blocked, st.pit, m.occ, st.difficult, st.water, st.climbable, st.deep, m.zone_diff,
+                             bool(zones), c.x, c.y, c.eid, spd.get("swim", 0) > 0, spd.get("climb", 0) > 0,
+                             bool(c.cond_mask >> 10 & 1), costs)
+        ml = ts.movement_left
+        fright = c.cond_mask & 8
+        for d in range(8):
+            cost = int(costs[d])
+            if cost == -2:
+                dx, dy = DIR_VECTORS[d]
+                v = self._step_cost(mv, dx, dy)
+                out[d] = v is not None and v <= ml and not (fright and self._frightened_blocks(c, dx, dy))
+            elif cost > 0:
+                out[d] = cost <= ml
+                if out[d] and fright:
+                    dx, dy = DIR_VECTORS[d]
+                    out[d] = not self._frightened_blocks(c, dx, dy)
+        return out
+
+    def move_mask_ref(self, eid: int) -> np.ndarray:
+        """Reference implementation (uncached); kept for differential tests."""
         c = self.entities[eid]
         out = np.zeros(10, dtype=bool)
         if eid != self.active or self.pending_decision is not None or self.done or not c.present:
@@ -2811,14 +3754,24 @@ class World(_Social):
         if c.cond_mask & INCAP_MASK or c.status & S.SURPRISED or ts.movement_left < 5 \
                 or R.base_speed(self, c) <= 0:
             return out
-        ml = ts.movement_left
+        mv = c
+        if c.mount >= 0:                                   # mounted: the controlled mount's squares and budget count
+            mv = self._steed(c)
+            if mv is None or mv.cond_mask & INCAP_MASK or R.base_speed(self, mv) <= 0:
+                return out
+        ml = mv.ts.movement_left
         for d in range(8):
             dx, dy = DIR_VECTORS[d]
-            cost = self._step_cost(c, dx, dy)
+            cost = self._step_cost(mv, dx, dy)
             out[d] = cost is not None and cost <= ml and not (c.cond_mask & 8 and self._frightened_blocks(c, dx, dy))
-        if c.speeds.get("fly", 0):
-            out[8] = c.z < 12
-            out[9] = c.z > 0 and (c.z > 1 or self._footprint_free_ground(c))
+        if mv.speeds.get("fly", 0) and mv.z >= 0:
+            out[8] = mv.z < 12
+            out[9] = mv.z > 0 and (mv.z > 1 or self._footprint_free_ground(mv))
+        if mv.speeds.get("burrow", 0) and mv is c:
+            if c.z < 0:
+                out[8] = self._can_emerge(c)
+            elif c.z == 0:
+                out[9] = self._can_burrow_down(c)
         return out
 
     def approach_mask(self, eid: int, cand_eids) -> np.ndarray:
@@ -2834,7 +3787,13 @@ class World(_Social):
         ts = c.ts
         if c.cond_mask & INCAP_MASK or ts.movement_left < 5 or R.base_speed(self, c) <= 0:
             return out
-        reach = self.reach_of(c)
+        rider = c
+        if c.mount >= 0:                                   # mounted: plan with the controlled mount's body and budget
+            c = self._steed(rider)
+            if c is None or c.cond_mask & INCAP_MASK or c.ts.movement_left < 5:
+                return out
+            ts = c.ts
+        reach = self.reach_of(rider)
         ents = self.entities
         ne = len(ents)
         hostile = Relation.HOSTILE
@@ -2844,18 +3803,17 @@ class World(_Social):
             if e < 0 or e >= ne or e == eid:
                 continue
             t = ents[e]
-            if not t.present or self.distance(eid, e) <= reach:
+            if not t.present or self.distance(eid, e) <= reach or e == c.eid:
                 continue
             if t.kind == EntityKind.CREATURE and self.relation(eid, e) == hostile and \
-                    not self.sees(eid, e) and e not in c.aware:
+                    not self.sees(eid, e) and e not in rider.aware:
                 continue
             idx.append(i)
         if not idx:
             return out
-        cost = self._approach_cost(c)
+        cost, dist = self._approach_field(c)
         rule = 1 if self.rules.diagonal_rule == "5-10-5" else 0
-        dist = geo.dijkstra(cost, c.x, c.y, 1e6, rule)
-        self._ap_field = (eid, c.x, c.y, rule, cost, dist)      # reused by the observation's reachable-cells channel
+        self._ap_field = (c.eid, c.x, c.y, rule, cost, dist)      # reused by the observation's reachable-cells channel
         k = len(idx)
         tx = np.empty(k, np.int64)
         ty = np.empty(k, np.int64)
@@ -2868,10 +3826,15 @@ class World(_Social):
         ground = c.z == 0
         occ = self.map.occ
         if ground:
-            cellok = (occ < 0) | (occ == eid)
-            for e in np.unique(occ[~cellok]).tolist():
-                if self._shares(c, ents[e]):
-                    cellok |= occ == e
+            cellok = (occ < 0) | (occ == c.eid)
+            vers = tuple([o.version for o in self.creatures])
+            sa = self._share_any
+            if sa is None or sa[0] != vers:
+                sa = self._share_any = (vers, any(R.hooks(o, "may_share_space") for o in self.creatures))
+            if sa[1]:                                     # nobody has a may_share_space hook: nothing to share
+                for e in np.unique(occ[~cellok]).tolist():
+                    if self._shares(c, ents[e]):
+                        cellok |= occ == e
         else:
             cellok = np.ones(occ.shape, bool)
         res = PA.approach_first_steps(dist, cost, cellok, c.x, c.y, c.size_sq, reach, ground, rule,
@@ -2885,7 +3848,7 @@ class World(_Social):
             if ok is None:
                 dx, dy = code // 3 - 1, code % 3 - 1
                 ok = not (self._step_cost(c, dx, dy, True) is None or
-                          (c.cond_mask & 8 and self._frightened_blocks(c, dx, dy)))
+                          (rider.cond_mask & 8 and self._frightened_blocks(rider, dx, dy)))
                 legal[code] = ok
             out[idx[j]] = ok
         return out
@@ -2900,23 +3863,28 @@ class World(_Social):
         ts = c.ts
         if c.cond_mask & INCAP_MASK or ts.movement_left < 5 or R.base_speed(self, c) <= 0:
             return out
-        reach = self.reach_of(c)
+        rider = c
+        if c.mount >= 0:
+            c = self._steed(rider)
+            if c is None or c.cond_mask & INCAP_MASK or c.ts.movement_left < 5:
+                return out
+        reach = self.reach_of(rider)
         dist = None
         cost = None
         for i in range(n):
             e = int(cand_eids[i])
-            if e < 0 or e >= len(self.entities) or e == eid:
+            if e < 0 or e >= len(self.entities) or e == eid or e == c.eid:
                 continue
             t = self.entities[e]
             if not t.present or self.distance(eid, e) <= reach:
                 continue
             if t.kind == EntityKind.CREATURE and self.relation(eid, e) == Relation.HOSTILE and \
-                    not self.sees(eid, e) and e not in c.aware:
+                    not self.sees(eid, e) and e not in rider.aware:
                 continue
             if dist is None:
                 cost = self._approach_cost(c)
                 dist = geo.dijkstra(cost, c.x, c.y, 1e6, 1 if self.rules.diagonal_rule == "5-10-5" else 0)
-            p = self._approach_path(c, t, cost, dist)
+            p = self._approach_path(c, t, cost, dist, reach)
             out[i] = bool(p)
         return out
 
@@ -2930,9 +3898,28 @@ class World(_Social):
             return (0.0, 0.0)
         return abil[k].estimate(self, self.entities[eid], t)
 
+    def estimate_many(self, eid: int, ks, targets) -> np.ndarray:
+        """``[len(ks), len(targets), 2]`` float array: ``estimate(eid, k, t)`` for every ability index in ``ks`` and every
+        target entity id in ``targets`` (one pass over the shared actor / target lookups; rows equal single calls)."""
+        abil = self.abilities(eid)
+        ents = self.entities
+        c = ents[eid]
+        na = len(abil)
+        out = np.zeros((len(ks), len(targets), 2))
+        tl = [ents[t] if 0 <= t < len(ents) and ents[t].kind == EntityKind.CREATURE else None for t in targets]
+        for i, k in enumerate(ks):
+            if k < 0 or k >= na:
+                continue
+            est = abil[k].estimate
+            row = out[i]
+            for j, t in enumerate(tl):
+                if t is not None:
+                    row[j] = est(self, c, t)
+        return out
+
     # ------------------------------------------------------------------ clone / snapshot / restore
     _SKIP = frozenset(("entities", "creatures", "objects", "traps", "map", "events", "rng", "zones", "relations", "objectives",
-                       "rules", "factions", "_sees_cache", "_cover_cache", "_fov_cache", "_light_cache",
+                       "rules", "factions", "_sees_cache", "_cover_cache", "_fov_cache", "_light_cache", "_mm_cache", "_mm_costs", "_af_cache",
                        "truce_offers", "bribes", "readied", "order", "outcome", "pending_decision", "stats",
                        "messages", "leg_pending", "_deferred", "regions", "_answers", "meta", "map_data", "ext", "round_hooks",
                        "_replay"))
@@ -2981,6 +3968,9 @@ class World(_Social):
         n._answers = list(self._answers)
         n._replay = self._replay
         n._sees_cache = {}
+        n._mm_cache = {}
+        n._af_cache = {}
+        n._mm_costs = np.zeros(8, np.int64)
         n._cover_cache = {}
         n._fov_cache = {}
         n._light_cache = None
@@ -2999,6 +3989,7 @@ class World(_Social):
     def restore(self, snap: "World") -> None:
         """Roll the world back to ``snap`` in place (World and Creature/object identities are preserved)."""
         n = snap.clone()
+        sv = self.state_version + 1
         ev_total = snap.__dict__.get("_snap_ev_total", self._ev_total)
         # events emitted after the snapshot are discarded
         keep = max(0, ev_total - self._ev_drained)
@@ -3028,6 +4019,7 @@ class World(_Social):
         self.map.door_eid = n.map.door_eid
         self.rng.bit_generator.state = snap.__dict__.get("_snap_rng", n.rng.bit_generator.state)
         self._deferred = []
+        self.state_version = sv
         self.vis_dirty()
         self._light_cache = None
         self._dec_idx = 0

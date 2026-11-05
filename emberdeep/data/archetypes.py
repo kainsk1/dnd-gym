@@ -22,7 +22,8 @@ from emberdeep.core.types import Ability as A
 from emberdeep.core.types import ArmorCategory, Skill as S
 from emberdeep.data.armor import ARMOR
 from emberdeep.data.classes import (
-    CLASSES, CLASS_SPELL_LISTS, ALWAYS_PREPARED_SUBCLASSES, bonus_spells_up_to, spell_counts,
+    CLASSES, CLASS_SPELL_LISTS, ALWAYS_PREPARED_SUBCLASSES, MULTICLASS_PROFICIENCIES, bonus_spells_up_to,
+    multiclass_prereqs_met, spell_counts,
 )
 from emberdeep.data.races import DRAGON_ANCESTRY, HIGH_ELF_CANTRIP_OPTIONS, RACES
 from emberdeep.data.schema import CharacterBuild
@@ -31,7 +32,7 @@ from emberdeep.data.weapons import WEAPONS
 from emberdeep.core.types import WeaponProperty
 
 __all__ = ["archetype", "ARCHETYPES", "random_build", "final_abilities", "NAME_POOL", "VARIANT_SPECS",
-           "DEFAULT_VARIANT", "roll_abilities"]
+           "DEFAULT_VARIANT", "roll_abilities", "MULTICLASS_VARIANTS", "multiclass_archetype", "legal_multiclass"]
 
 NAME_POOL: tuple[str, ...] = (
     "Aldric Vane", "Brannoch Hale", "Cassia Thornfield", "Dorrin Ashgrove", "Elowen Marsh", "Fenwick Dray",
@@ -275,7 +276,8 @@ def _asi_entries(scores: list[int], primary: A, build_scores_rank: list[int]) ->
 # Core builder
 # ---------------------------------------------------------------------------------------------
 def build_variant(variant: str, level: int = 1, race: str | None = None, name: str | None = None,
-                  base_abilities: tuple[int, ...] | None = None, rng: Any = None) -> CharacterBuild:
+                  base_abilities: tuple[int, ...] | None = None, rng: Any = None,
+                  exact_base: bool = False) -> CharacterBuild:
     """Build a :class:`CharacterBuild` for a named variant (see :data:`VARIANT_SPECS`)."""
     if not 1 <= level <= 5:
         raise ValueError("archetypes support levels 1-5")
@@ -301,7 +303,7 @@ def build_variant(variant: str, level: int = 1, race: str | None = None, name: s
             bonus = tuple(A(i) for i in rank if i != int(A.CHA))[:2]
         choices["half_elf_bonus"] = tuple(bonus)
     # Standard-array assignment: scores sorted by the variant's ranking when custom abilities are supplied.
-    if base_abilities is not None:
+    if base_abilities is not None and not exact_base:
         ordered = sorted(base, reverse=True)
         arr = [0] * 6
         for pos, idx in enumerate(rank):
@@ -427,8 +429,79 @@ def build_variant(variant: str, level: int = 1, race: str | None = None, name: s
         icon=cdef.icon, portrait_tint=_TINT[cls_id])
 
 
+# ---------------------------------------------------------------------------------------------
+# Multiclass archetypes (v1.1)
+# ---------------------------------------------------------------------------------------------
+#: name -> dict(primary=variant of the first class, secondary=variant of the second, race, base=(STR..CHA) before racial
+#: bonuses).  The ability scores satisfy both classes' multiclass prerequisites.
+MULTICLASS_VARIANTS: dict[str, dict[str, Any]] = {
+    "paladin_sorcerer": dict(primary="paladin", secondary="sorcerer", race="dragonborn",
+                             base=(15, 12, 13, 8, 10, 14)),
+    "fighter_wizard": dict(primary="fighter", secondary="wizard", race="human", base=(15, 12, 14, 13, 10, 8)),
+    "rogue_fighter": dict(primary="rogue", secondary="fighter", race="lightfoot_halfling",
+                          base=(12, 15, 14, 10, 13, 8)),
+    "cleric_druid": dict(primary="cleric", secondary="druid", race="hill_dwarf", base=(13, 10, 14, 8, 15, 12)),
+}
+
+
+def legal_multiclass(class_ids, scores) -> bool:
+    """Do the final ability ``scores`` satisfy the multiclass prerequisites of every class in ``class_ids``?"""
+    return all(multiclass_prereqs_met(c, scores) for c in class_ids)
+
+
+def _merge_choices(a: dict, b: dict) -> dict:
+    out = dict(b)
+    out.update(a)
+    return out
+
+
+def multiclass_archetype(variant: str, level: int = 4, race: str | None = None,
+                         name: str | None = None) -> CharacterBuild:
+    """Two-class build for a :data:`MULTICLASS_VARIANTS` entry at total ``level`` 2-5 (secondary gets level // 2)."""
+    spec = MULTICLASS_VARIANTS[variant]
+    if not 2 <= level <= 5:
+        raise ValueError("multiclass archetypes support total levels 2-5")
+    ls = max(1, level // 2)
+    lp = level - ls
+    race_id = race or spec["race"]
+    base = tuple(spec["base"])
+    P = build_variant(spec["primary"], lp, race_id, name, base, exact_base=True)
+    S = build_variant(spec["secondary"], ls, race_id, name, base, exact_base=True)
+    cp, cs = P.class_id, S.class_id
+    choices = _merge_choices(P.choices, S.choices)
+    choices["class_spells"] = {cp: P.spells, cs: S.spells}
+    choices["class_cantrips"] = {cp: P.cantrips, cs: S.cantrips}
+    nsk = MULTICLASS_PROFICIENCIES[cs][2]
+    if nsk:
+        choices["mc_skills"] = {cs: tuple(s for s in S.skills if s not in P.skills)[:nsk]}
+    final = final_abilities(P)
+    if not legal_multiclass((cp, cs), final):
+        raise ValueError(f"{variant}: ability scores {final} violate the multiclass prerequisites")
+    prof = set(CLASSES[cp].armor_proficiencies) | set(MULTICLASS_PROFICIENCIES[cs][0])
+    armor, shield = P.armor, P.shield
+    for cand in (P.armor, S.armor):
+        if cand and ARMOR[cand].category in prof and ARMOR[cand].str_req <= final[0]:
+            armor = cand
+            break
+    else:
+        armor = ""
+    shield = (P.shield or S.shield) and ArmorCategory.SHIELD in prof
+    weapons = tuple(dict.fromkeys(P.weapons + S.weapons))[:4]
+    items = tuple(dict.fromkeys(P.items + S.items))
+    sub_p = P.subclass
+    sub_s = S.subclass
+    return CharacterBuild(
+        name=P.name, race=race_id, class_id=cp, level=level, subclass=sub_p, base_abilities=base,
+        asi=P.asi + S.asi, skills=P.skills, expertise=tuple(dict.fromkeys(P.expertise + S.expertise)),
+        fighting_style=P.fighting_style or S.fighting_style, cantrips=P.cantrips, spells=P.spells, choices=choices,
+        weapons=weapons, armor=armor, shield=bool(shield), items=items, gold=P.gold, icon=P.icon,
+        portrait_tint=P.portrait_tint, classes=((cp, lp, sub_p), (cs, ls, sub_s)))
+
+
 def archetype(class_id: str, level: int = 1, race: str | None = None, name: str | None = None) -> CharacterBuild:
     """Canonical build for ``class_id`` (or a variant name) at ``level`` (1-5), optionally overriding the race."""
+    if class_id in MULTICLASS_VARIANTS:
+        return multiclass_archetype(class_id, level, race, name)
     if class_id in VARIANT_SPECS:     # named variants ("fighter_archer") are accepted too
         return build_variant(class_id, level, race, name)
     if class_id not in CLASSES:
@@ -448,12 +521,17 @@ ARCHETYPES: dict[str, Callable[..., CharacterBuild]] = {v: _make_archetype(v) fo
 
 
 def random_build(rng: Any, level: int, class_id: str | None = None, race: str | None = None,
-                 roll_scores: bool = True) -> CharacterBuild:
+                 roll_scores: bool = True, multiclass_prob: float = 0.0) -> CharacterBuild:
     """Randomised legal build for domain randomisation.
 
     Race and class are drawn from ``rng`` unless given; ability scores are 4d6-drop-lowest (or the standard
     array when ``roll_scores`` is false) assigned to the variant's priorities; ancestry / names vary.
     """
+    if multiclass_prob > 0 and class_id is None and 2 <= level <= 5 and float(rng.random()) < multiclass_prob:
+        names = sorted(MULTICLASS_VARIANTS)
+        v = names[int(rng.integers(0, len(names)))]
+        nm = NAME_POOL[int(rng.integers(0, len(NAME_POOL)))]
+        return multiclass_archetype(v, level, race, nm)
     cid = class_id or sorted(CLASSES)[int(rng.integers(0, len(CLASSES)))]
     if cid == "fighter":
         variant = _FIGHTER_VARIANTS[int(rng.integers(0, len(_FIGHTER_VARIANTS)))]

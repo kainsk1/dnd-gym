@@ -248,7 +248,7 @@ def vanish(world, c) -> None:
 
 # =============================================================================== attacks
 def spell_attack(world, caster, target, name: str, source_id: str, comps, kind=None, ability=None, spell=None,
-                 on_hit=None, adv=(), dis=()):
+                 on_hit=None, adv=(), dis=(), extra=None):
     """Resolve one spell attack roll of ``caster`` against ``target`` with damage components ``comps``."""
     from emberdeep.core.types import AttackKind
     kind = AttackKind.MELEE_SPELL if kind is None else kind
@@ -260,6 +260,8 @@ def spell_attack(world, caster, target, name: str, source_id: str, comps, kind=N
     ctx.on_hit_fn = on_hit
     ctx.adv.extend(adv)
     ctx.dis.extend(dis)
+    if extra:
+        ctx.extra.update(extra)
     return R.resolve_attack(world, ctx)
 
 

@@ -142,6 +142,7 @@ class EntityView:
     value_gp: int = 0                       # loot piles / chests (if known)
     # bookkeeping for UI
     stats: dict[str, float] = field(default_factory=dict)   # per-agent episode stats (damage dealt, gold, heals...)
+    mounted_on: int = -1                    # eid of the mount this creature rides (drawn smaller on top of it)
 
 
 @dataclass

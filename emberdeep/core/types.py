@@ -143,9 +143,13 @@ class Status(IntFlag):
     FLYING = 1 << 15        # currently aloft (z > 0 or hovering)
     ESCAPED = 1 << 16       # left the map through an exit (removed from play, alive)
     SUMMONED = 1 << 17
+    MOUNTED = 1 << 18       # currently riding a mount
+    CARRYING_RIDER = 1 << 19  # a mount that carries a rider
+    SQUEEZING = 1 << 20     # squeezing through a space narrower than its size
+    BURROWED = 1 << 21      # underground (z < 0)
 
 
-N_STATUS_BITS = 18
+N_STATUS_BITS = 22
 
 
 class Size(IntEnum):
@@ -418,6 +422,7 @@ class DecisionKind(IntEnum):
     LEGENDARY = 9            # take a legendary action at the end of another creature's turn (engine addition)
     SPELL_CHOICE = 10        # choose an option of a spell being cast (Command verb, Enhance Ability score ...)
     ON_FALL = 11             # a creature is about to take falling damage (Feather Fall)
+    POST_ROLL = 12           # a d20 was rolled and its result is known; spend a die/feature to change it
 
 
 class ObjectiveKind(IntEnum):

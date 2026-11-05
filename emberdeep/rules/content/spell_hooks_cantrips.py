@@ -226,8 +226,7 @@ class MinorIllusionLink(SpellEffect):
             z.state.setdefault("tried", {})[o.eid] = 1
             _, ok, _ = R.ability_check(world, o, Skill.INVESTIGATION, R.spell_dc(me), purpose="minor_illusion")
             if ok:
-                Z.remove_zone(world, z, "discerned")
-                return
+                world.discern_illusion(z, o.eid)                   # per observer: the image still blocks the others
 
 
 # =============================================================================== produce flame

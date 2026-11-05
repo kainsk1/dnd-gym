@@ -6,7 +6,8 @@ from __future__ import annotations
 from emberdeep.core import effects as EF
 from emberdeep.core import resolution as R
 from emberdeep.core.events import EventType as ET
-from emberdeep.core.types import ActionCost, Condition, CreatureType, TargetType
+from emberdeep.core.decisions import DecisionOption, decide
+from emberdeep.core.types import ActionCost, Condition, CreatureType, DecisionKind, TargetType
 from emberdeep.rules.content.class_cleric import _turn_targets, turn_creatures
 from emberdeep.rules.content.class_common import fab
 from emberdeep.rules.registry import Feature, register_feature
@@ -47,21 +48,29 @@ class DivineSense(Feature):
 
 @register_feature("lay_on_hands")
 class LayOnHands(Feature):
-    """Action: touch a creature and restore HP from the pool (``lay_on_hands`` resource, 5 x paladin level; long rest),
-    as much as it needs up to the pool; or spend 5 points to neutralise the poison affecting it.  No effect on undead
-    and constructs."""
-    HOOKS = frozenset({"grant_abilities"})
+    """Action: touch a creature and restore any number of HP from the pool (``lay_on_hands`` resource, 5 x paladin level;
+    long rest), or spend 5 points to neutralise one disease or the poison affecting it.  No effect on undead and
+    constructs.  The amount is a decision (``SPELL_CHOICE``: 1 / 5 / 10 / as much as it needs); scripted paladins heal
+    as much as the target needs."""
+    HOOKS = frozenset({"grant_abilities", "reaction_options"})        # reaction_options: marker, snapshots agent paladins
+
+    def reaction_options(self, world, me, kind, ctx):
+        return ()
 
     def grant_abilities(self, world, me):
         return [fab(self, "lay_on_hands", "Lay on Hands", ActionCost.ACTION, TargetType.SELF_OR_ALLY, range_sq=1,
                     reach_sq=1, vfx="lay_on_hands", tags=("heal", "support"), mode="heal"),
-                fab(self, "lay_on_hands_cure", "Lay on Hands: Cure Poison", ActionCost.ACTION,
+                fab(self, "lay_on_hands_cure", "Lay on Hands: Cure Poison or Disease", ActionCost.ACTION,
                     TargetType.SELF_OR_ALLY, range_sq=1, reach_sq=1, vfx="lay_on_hands", tags=("heal", "support"),
                     mode="cure")]
 
     def can_use(self, world, actor, ab):
         pool = actor.resources.get("lay_on_hands", 0)
         return pool >= (int(self.params.get("cure_cost", 5)) if ab.data["mode"] == "cure" else 1)
+
+    @staticmethod
+    def _diseased(t) -> bool:
+        return EF.has_effect(t, "wasting_disease")
 
     def valid_target(self, world, actor, ab, eid):
         from emberdeep.core import abilities as AB
@@ -71,17 +80,29 @@ class LayOnHands(Feature):
         if int(t.ctype) in _NO_HEAL_TYPES:
             return False
         if ab.data["mode"] == "cure":
-            return t.has(Condition.POISONED)
+            return t.has(Condition.POISONED) or self._diseased(t)
         return t.hp < t.max_hp
+
+    def amount(self, world, actor, t, pool: int) -> int:
+        cap = min(pool, t.max_hp - t.hp)
+        amounts = sorted({a for a in (1, 5, 10) if a < cap})
+        opts = [DecisionOption(str(a), f"Heal {a}", {"amount": a, "auto": False}) for a in amounts]
+        opts.append(DecisionOption("max", f"Heal {cap}", {"amount": cap, "auto": True}))
+        i = decide(world, actor.eid, DecisionKind.SPELL_CHOICE, opts,
+                   {"spell": "lay_on_hands", "choice": "amount", "post_roll": True, "target": t.eid})
+        return int(opts[i - 1].data["amount"]) if i > 0 else cap
 
     def use(self, world, actor, ab, eid, point):
         t = world.entities[eid]
         pool = actor.resources.get("lay_on_hands", 0)
         if ab.data["mode"] == "cure":
             actor.resources["lay_on_hands"] = pool - int(self.params.get("cure_cost", 5))
-            R.remove_condition(world, t, Condition.POISONED)
+            if t.has(Condition.POISONED):
+                R.remove_condition(world, t, Condition.POISONED)
+            elif self._diseased(t):
+                EF.remove_by_id(world, t, "wasting_disease", "lay_on_hands")
             return
-        amt = min(pool, t.max_hp - t.hp)
+        amt = self.amount(world, actor, t, pool)
         actor.resources["lay_on_hands"] = pool - amt
         R.heal(world, actor, t, amt, "lay_on_hands")
 

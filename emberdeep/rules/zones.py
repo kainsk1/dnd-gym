@@ -18,6 +18,7 @@ from emberdeep.core.entities import S
 
 from emberdeep.core import dice as D
 from emberdeep.core import resolution as R
+from emberdeep.core.events import EventType as ET
 from emberdeep.core.types import Ability, DamageType, Relation, Status
 from emberdeep.rules.registry import register_zone
 
@@ -77,6 +78,9 @@ class ZoneImpl:
 
     def on_turn_end(self, world, z, c) -> None:
         pass
+
+    def on_damage(self, world, z, dctx, rows) -> None:
+        """A creature inside the zone is being damaged (``rows`` = [raw, amount, dtype, label]); engine call site."""
 
 
 class GenericZone(ZoneImpl):
@@ -221,10 +225,41 @@ class Darkness(GenericZone):
         return True
 
 
+def web_round_hook(world, rnd) -> None:
+    """Round-start hook (module level, so it survives World.clone): burning webs burn away one round after they ignite."""
+    from emberdeep.core import zones as Z
+    for z in list(world.zones):
+        if z.kind == "web" and z.state.get("burning") is not None and rnd > z.state["burning"]:
+            Z.remove_zone(world, z, "burned")
+
+
 @register_zone("web")
 class Web(GenericZone):
-    """Difficult terrain; DEX save or restrained (escape: STR check vs spell DC)."""
+    """Difficult terrain; DEX save or restrained (escape: STR check vs spell DC).  Fire damage to a creature inside sets
+    the web alight (``on_damage``): it burns away within a round and deals 2d4 fire to creatures that start their turn
+    in it (no restraint while it burns)."""
     TRIGGERS = ("enter", "start")
+
+    def on_create(self, world, z):
+        if web_round_hook not in world.round_hooks:
+            world.round_hooks.append(web_round_hook)
+
+    def on_damage(self, world, z, dctx, rows):
+        if z.state.get("burning") is None and any(r[2] == int(DamageType.FIRE) and r[1] > 0 for r in rows):
+            z.state["burning"] = world.round
+            world.emit(ET.LOG, z.source, -1, 0, -1, {"text": "the web catches fire", "level": 1})
+
+    def on_enter(self, world, z, c):
+        if z.state.get("burning") is None:
+            super().on_enter(world, z, c)
+
+    def on_turn_start(self, world, z, c):
+        if z.state.get("burning") is None:
+            return super().on_turn_start(world, z, c)
+        if self.affects(world, z, c):
+            src = world.entities[z.source] if z.source >= 0 else None
+            R.make_damage(world, src, c, [["2d4", int(DamageType.FIRE), True]], source="web_fire", is_spell=True,
+                          area=True, magical=True, apply_mods=False)
 
 
 @register_zone("grease")

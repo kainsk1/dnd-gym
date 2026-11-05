@@ -34,6 +34,7 @@ class PartyFrames:
         self.rflash: dict[str, tuple[float, float]] = {}   # agent -> (sign, strength)
         self.rect = pygame.Rect(0, 0, 0, 0)
         self._cache = T._LRU(48)
+        self.active_rect: pygame.Rect | None = None
 
     # --------------------------------------------------------------- data
     def members(self) -> list:
@@ -46,8 +47,12 @@ class PartyFrames:
         for e in fr.entities:
             if e.kind != "creature":
                 continue
-            if e.agent_id is not None or e.controller in ("agent", "human") or e.faction in player:
+            if e.agent_id is not None or e.controller in ("agent", "human"):
                 out.append(e)
+        if not out:                                      # scripted-party scenes: fall back to player-side creatures
+            mounts = {getattr(e, "mounted_on", -1) for e in fr.entities}
+            out = [e for e in fr.entities if e.kind == "creature" and e.faction in player and e.alive and not e.dead
+                   and e.id not in mounts]
         return sorted(out, key=lambda e: e.id)
 
     def on_frame(self, frame) -> None:
@@ -102,6 +107,7 @@ class PartyFrames:
         gap = ui.s(8)
         cw = ui.s(292)
         y = area.y
+        self.active_rect = None
         # header toggle
         hdr = pygame.Rect(area.x, y, cw, ui.s(26))
         ui.draw_panel(surf, hdr, "plate")
@@ -173,12 +179,18 @@ class PartyFrames:
             rows.append(cur_row)
         return rows
 
+    def mount_of(self, e):
+        mid = getattr(e, "mounted_on", -1)
+        return self.hud.ent(mid) if mid is not None and mid >= 0 else None
+
     def _height(self, e, compact: bool) -> int:
         ui = self.hud.ui
         pad = ui.s(10)
         if compact:
             return pad * 2 + ui.s(40)
         h = pad * 2 + ui.s(46) + ui.s(8) + ui.s(18)
+        if self.mount_of(e) is not None:
+            h += ui.s(6) + ui.s(14)
         if e.conditions or e.effects or e.statuses or e.concentration:
             h += ui.s(6) + ui.s(20)
         if e.downed and not e.dead:
@@ -200,7 +212,8 @@ class PartyFrames:
         mx = max(1, e.max_hp)
         q = lambda v, k: int(v * k)  # noqa: E731
         ag = e.agent_id
-        key = (e.id, e.name, e.hp, e.max_hp, e.temp_hp, e.ac, tuple(e.conditions), tuple(e.effects), tuple(e.statuses),
+        mt0 = self.mount_of(e)
+        key = (mt0.name if mt0 else '', mt0.hp if mt0 else 0, e.id, e.name, e.hp, e.max_hp, e.temp_hp, e.ac, tuple(e.conditions), tuple(e.effects), tuple(e.statuses),
                e.concentration, tuple(sorted(e.resources.items())), e.gold, e.death_saves, e.downed, e.dead, e.alive,
                compact, r.w, r.h, ui.scale, view.pov, e.id == fr.active_id,
                q(a.shown / mx, r.w) if a else 0, q(a.ghost / mx, r.w) if a else 0, q(a.flash, 20) if a else 0,
@@ -211,26 +224,35 @@ class PartyFrames:
         m = ui.s(12)
         if cached is None:
             tmp = pygame.Surface((r.w + 2 * m, r.h + 2 * m), pygame.SRCALPHA)
+            prev_cap = hud._capture
             hud._capture = []
             try:
                 self._card_draw(tmp, pygame.Rect(m, m, r.w, r.h), e, compact, view)
                 hots = hud._capture
             finally:
-                hud._capture = None
+                hud._capture = prev_cap
             cached = self._cache.put(key, (tmp, hots))
         tmp, hots = cached
         surf.blit(tmp, (r.x - m, r.y - m))
         dx, dy = r.x - m, r.y - m
         for h in hots:
             h2 = Hot(h.rect.move(dx, dy), h.tip, h.click, h.right, h.wheel, h.drag, h.block, h.name)
-            hud._new_hots.append(h2)
+            (hud._capture if hud._capture is not None else hud._new_hots).append(h2)
         if e.id == fr.active_id:
-            gl = pygame.Surface(r.size, pygame.SRCALPHA)
-            pygame.draw.rect(gl, (*T.GOLD_HI, 150), gl.get_rect(), width=max(2, ui.s(2)), border_radius=ui.s(6))
-            gl.set_alpha(int(255 * (0.65 + 0.35 * math.sin(hud.t * 3))))
-            surf.blit(gl, r.topleft)
+            self.active_rect = r.copy()
         elif e.id == view.selected_eid:
             pygame.draw.rect(surf, T.GOLD_HI, r, width=1, border_radius=ui.s(6))
+
+    def draw_overlay(self, surf) -> None:
+        """Pulsing glow around the active card (drawn live; the card art itself is cached)."""
+        r = self.active_rect
+        if r is None:
+            return
+        ui = self.hud.ui
+        gl = pygame.Surface(r.size, pygame.SRCALPHA)
+        pygame.draw.rect(gl, (*T.GOLD_HI, int(255 * (0.55 + 0.4 * math.sin(self.hud.t * 3)))), gl.get_rect(),
+                         width=max(2, ui.s(2)), border_radius=ui.s(6))
+        surf.blit(gl, r.topleft)
 
     def _card_draw(self, surf, r: pygame.Rect, e, compact: bool, view) -> None:
         hud, ui = self.hud, self.hud.ui
@@ -304,6 +326,19 @@ class PartyFrames:
                              ui.s(16), T.RED)
             return
         y = bar.bottom + ui.s(6)
+        mt = self.mount_of(e)
+        if mt is not None:
+            ui.blit_icon(surf, "horse-head", (r.x + pad + ui.s(7), y + ui.s(7)), ui.s(14), T.TEXT_DIM)
+            nm_s = ui.text(ui.ellipsize(mt.name, "body", 11, ui.s(110)), "body", 11, T.TEXT_DIM)
+            surf.blit(nm_s, nm_s.get_rect(midleft=(r.x + pad + ui.s(18), y + ui.s(7))))
+            mb = pygame.Rect(r.x + pad + ui.s(18) + nm_s.get_width() + ui.s(8), y + ui.s(3), 0, ui.s(8))
+            mb.w = r.right - pad - mb.x
+            if mb.w > ui.s(20):
+                mf = max(0.0, min(1.0, mt.hp / max(1, mt.max_hp)))
+                ui.bar(surf, mb, mf, T.hp_color(mf), border=False)
+                hud.hot(pygame.Rect(r.x + pad, y, r.w - 2 * pad, ui.s(14)),
+                        tip=Tip(mt.name, "Mount", [(f"{mt.hp} / {mt.max_hp} HP", T.TEXT)], "horse-head"))
+            y += ui.s(20)
         # status icons row
         items: list[tuple[str, str]] = []
         for c in e.conditions:

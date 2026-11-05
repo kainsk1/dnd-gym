@@ -56,6 +56,18 @@ class HUD(HUDProtocol):
         self._new_hots: list[Hot] = []
         self._capture: list[Hot] | None = None
         self.safe: pygame.Rect | None = None
+        # --- change tracking: ``dirty`` is valid after update(); False means the last draw is still exact
+        self.dirty = True
+        self._force = True
+        self._sig = None
+        self._ps = -1
+        self._mouse_t = -9.0
+        self.version = 0
+        self._P: pygame.Surface | None = None
+        self._P_scale = 0.0
+        self._pc: dict = {}
+        self._seen: set = set()
+        self.panel_redraws = 0
         self.modal_prev = False
         self._modal_now = False
         self._in_modal = False
@@ -85,6 +97,7 @@ class HUD(HUDProtocol):
 
     # ================================================================= protocol
     def set_scene(self, scene: StaticScene) -> None:
+        self._force = True
         self.scene = scene
         self.frame = None
         self._emap.clear()
@@ -100,6 +113,7 @@ class HUD(HUDProtocol):
         self.actionbar.end_choice()
 
     def on_frame(self, frame: FrameState) -> None:
+        self._force = True
         self._ingest(frame)
         self.party.on_frame(frame)
         for ag, ret in frame.returns.items():
@@ -115,6 +129,7 @@ class HUD(HUDProtocol):
             self.final_kind = None
 
     def on_event(self, event: dict, frame: FrameState, view: ViewInfo) -> None:
+        self._force = True
         try:
             if frame is not None:
                 if self.frame is None or frame.step >= self.frame.step:
@@ -151,6 +166,45 @@ class HUD(HUDProtocol):
         self.floating.update(dt)
         self.banners.update(dt)
         self.scoreboard.update(dt)
+        self.dirty = self._compute_dirty(view)
+
+    def _compute_dirty(self, view: ViewInfo) -> bool:
+        """True when anything visible may differ from the last draw (inputs, events, animation, camera)."""
+        d = self._force or self.frame is None
+        try:
+            es = tuple((k, int(v[0]), int(v[1]), int(v[2])) for k, v in view.entity_screen.items())
+            x0, y0 = view.world_to_screen(0, 0)
+            sig = (view.screen_size, es, view.hovered_eid, view.hovered_cell, view.selected_eid, view.pov, view.paused,
+                   view.speed, view.human_turn, tuple(sorted(view.options.items())), int(x0), int(y0),
+                   round(view.cell_px, 1), tuple(self.mouse))
+        except Exception:  # noqa: BLE001
+            sig = object()
+        if sig != self._sig:
+            if self._sig is not None and sig[-1] != self._sig[-1]:
+                self._mouse_t = self.t
+            self._sig = sig
+            d = True
+        if self.t - self._mouse_t < 0.7:                     # tooltip delay / fade
+            d = True
+        fr = self.frame
+        if fr is not None and not d:
+            fl = self.floating
+            if fl.floaters or fl.bubbles or self.banners.big or self.banners.small or self.banners.final is not None:
+                d = True
+            elif self.party.rflash or self.ribbon.moving or self.scoreboard.shown or self.help_open or fr.done:
+                d = True
+            elif any(abs(a.shown - a.last) > 0.01 or a.ghost - a.shown > 0.01 or a.flash > 0 or a.hurt > 0
+                     for a in self.party.anim.values()):
+                d = True
+            elif self.log.entries and self.t - self.log.entries[-1].born < 1.4:
+                d = True
+            elif fr.mode == "combat" or self.actionbar.active:   # pulsing highlights: redraw at 10 Hz
+                ps = int(self.t * 10)
+                if ps != self._ps:
+                    d = True
+        if d:
+            self._ps = int(self.t * 10)
+        return d
 
     def draw(self, surface: pygame.Surface, view: ViewInfo) -> None:
         t0 = time.perf_counter()
@@ -170,23 +224,74 @@ class HUD(HUDProtocol):
             log.exception("HUD.draw failed")
         self.hots = self._new_hots
         self.modal_prev = self._modal_now
+        self.dirty = False
+        self._force = False
+        self.version += 1
         self.draw_ms = (time.perf_counter() - t0) * 1000.0
+
+    # ---- per-panel cached composition -------------------------------------------------------------
+    def _panel(self, name: str, surf: pygame.Surface, rect: pygame.Rect, key, fn, extra: pygame.Rect | None = None) -> None:
+        """Render a panel into the shared panel layer only when ``key`` changed, then copy its region to ``surf``."""
+        ui = self.ui
+        P = self._P
+        mg = ui.s(7)
+        region = rect.inflate(2 * mg, 2 * mg)
+        if extra is not None:
+            region = region.union(extra)
+        region = region.clip(P.get_rect())
+        mp = self.mouse
+        if region.collidepoint(mp):
+            key = (key, mp)
+        ent = self._pc.get(name)
+        if ent is None or ent[0] != key or ent[1] != region:
+            if ent is not None and ent[1] != region:
+                P.fill((0, 0, 0, 0), ent[1])
+            P.set_clip(region)
+            P.fill((0, 0, 0, 0), region)
+            prev = self._capture
+            self._capture = []
+            try:
+                fn(P)
+                hots = self._capture
+            finally:
+                self._capture = prev
+                P.set_clip(None)
+            ent = (key, region, hots)
+            self._pc[name] = ent
+            self.panel_redraws += 1
+        self._seen.add(name)
+        surf.blit(self._P, region.topleft, region, special_flags=pygame.BLEND_RGBA_ADD)
+        self._new_hots.extend(ent[2])
 
     def _draw(self, surf: pygame.Surface, view: ViewInfo, W: int, H: int) -> None:
         ui = self.ui
         fr = self.frame
+        if self._P is None or self._P.get_size() != (W, H) or self._P_scale != ui.scale:
+            self._P = pygame.Surface((W, H), pygame.SRCALPHA)
+            self._P_scale = ui.scale
+            self._pc.clear()
+        self._seen = set()
         m = ui.s(14)
         gap = ui.s(10)
         colw = ui.s(344)
         party_w = ui.s(292)
-        # world-space layer first (under panels)
-        self.floating.draw_nameplates(surf, view)
+        step = int(self.t * 10)
+        combat = fr.mode == "combat"
+        fid = id(fr)
         # ---- left: party
-        self.party.draw(surf, pygame.Rect(m, m, party_w, H - 2 * m), view)
+        prect = pygame.Rect(m, m, party_w, H - 2 * m)
+        pkey = (fid, self.party.compact, fr.active_id, view.selected_eid, view.pov,
+                tuple((e.id, int(a.shown * 4), int(a.ghost * 4), int(a.flash * 20), int(a.hurt * 20))
+                      for e in self.party.members() for a in [self.party.anim.get(e.id)] if a is not None),
+                tuple((k, int(v[1] * 10)) for k, v in self.party.rflash.items()))
+        self._panel("party", surf, prect, pkey, lambda s_: self.party.draw(s_, prect, view))
         # ---- top centre: ribbon
         left_edge = m + party_w + gap
         right_edge = W - m - colw - gap
-        self.ribbon.draw(surf, pygame.Rect(left_edge, m, max(ui.s(300), right_edge - left_edge), 0), view)
+        rb = pygame.Rect(left_edge, m, max(ui.s(300), right_edge - left_edge), ui.s(124))
+        rkey = (fid, fr.active_id, view.pov, self.ribbon.moving,
+                self.t if self.ribbon.moving else 0, tuple(sorted(self.ribbon.surprised)))
+        self._panel("ribbon", surf, rb, rkey, lambda s_: self.ribbon.draw(s_, pygame.Rect(rb.x, rb.y, rb.w, 0), view))
         self.safe = pygame.Rect(left_edge - gap, 0, right_edge - left_edge + gap, H)
         # ---- right column
         rx = W - m - colw
@@ -197,28 +302,56 @@ class HUD(HUDProtocol):
             pad = ui.s(10)
             map_h = min(ui.s(168), int((colw - 2 * pad) / aspect))
             mh = pad * 2 + ui.s(22) + map_h
-            self.minimap.draw(surf, pygame.Rect(rx, y, colw, mh), view)
+            mr = pygame.Rect(rx, y, colw, mh)
+            x0, y0 = view.screen_to_world(0, 0)
+            x1, y1 = view.screen_to_world(*view.screen_size)
+            mkey = (fid, view.pov, fr.active_id, int(x0 * 6), int(y0 * 6), int(x1 * 6), int(y1 * 6))
+            self._panel("minimap", surf, mr, mkey, lambda s_: self.minimap.draw(s_, mr, view))
             y += mh + gap
         ctl_h = ui.s(30) + ui.s(8) + ui.s(24) + ui.s(8) + ui.s(26) + ui.s(20)
         ctl_rect = pygame.Rect(rx, H - m - ctl_h, colw, ctl_h)
         if self.opt(view, "research"):
             rh = min(self.research.height(), max(ui.s(120), ctl_rect.y - y - gap - ui.s(120)))
-            self.research.draw(surf, pygame.Rect(rx, y, colw, rh), view)
+            rr = pygame.Rect(rx, y, colw, rh)
+            self._panel("research", surf, rr, (fid, view.pov, fr.active_id, self.history and len(next(iter(self.history.values())))),
+                        lambda s_: self.research.draw(s_, rr, view))
             y += rh + gap
         if self.opt(view, "log"):
             lh = ctl_rect.y - gap - y
             if self.log.collapsed:
                 lh = ui.s(40)
             if lh > ui.s(60):
-                self.log.draw(surf, pygame.Rect(rx, y, colw, lh))
-        self.controls.draw(surf, ctl_rect, view)
+                lr = pygame.Rect(rx, y, colw, lh)
+                lg = self.log
+                last = lg.entries[-1] if lg.entries else None
+                age = self.t - last.born if last is not None else 9.0
+                lkey = (len(lg.entries), id(last), lg.filter, lg.collapsed, int(lg.scroll), lg._unseen,
+                        int(age * 8) if age < 1.4 else -1)
+                self._panel("log", surf, lr, lkey, lambda s_: lg.draw(s_, lr))
+        pov_extra = None
+        if self.controls.pov_open:
+            n_opt = len(self.pov_options(view))
+            pov_extra = pygame.Rect(ctl_rect.x, ctl_rect.y - ui.s(28) * n_opt - ui.s(30), colw, ui.s(28) * n_opt + ui.s(30))
+        ckey = (view.paused, view.speed, view.pov, tuple(sorted(view.options.items())), self.controls.pov_open,
+                self.modal_prev)
+        self._panel("controls", surf, ctl_rect, ckey, lambda s_: self.controls.draw(s_, ctl_rect, view), pov_extra)
         # ---- inspector (docked left of the right column)
         if self.inspector.visible(view):
             iw = ui.s(336)
             ix = rx - gap - iw
             iy = self.ribbon.rect.bottom + gap if self.ribbon.rect.h else m
             ih = H - m - iy - (self.actionbar.rect.h + gap if self.actionbar.active and self.actionbar.rect.right > ix else 0)
-            self.inspector.draw(surf, pygame.Rect(ix, iy, iw, max(ui.s(200), ih)), view)
+            ir = pygame.Rect(ix, iy, iw, max(ui.s(200), ih))
+            self._panel("inspector", surf, ir, (fid, view.selected_eid, view.pov, int(self.inspector.scroll), ir),
+                        lambda s_: self.inspector.draw(s_, ir, view))
+        for k in list(self._pc):
+            if k not in self._seen:                      # panel disappeared: wipe its region
+                self._P.fill((0, 0, 0, 0), self._pc[k][1])
+                del self._pc[k]
+        # ---- world-space overlays (cheap, redrawn every frame)
+        self.party.draw_overlay(surf)
+        self.ribbon.draw_overlay(surf)
+        self.floating.draw_nameplates(surf, view)
         self.floating.draw(surf, view)
         # ---- banners
         self.banners.draw(surf, view, self.ribbon.rect.bottom if self.ribbon.rect.h else m)
@@ -302,6 +435,8 @@ class HUD(HUDProtocol):
 
     def _handle(self, ev, view: ViewInfo) -> UICommand | None:  # noqa: C901
         t = ev.type
+        if t != pygame.MOUSEMOTION:
+            self._force = True
         if t == pygame.MOUSEMOTION:
             self.mouse = ev.pos
             self._saw_motion = True
@@ -443,9 +578,11 @@ class HUD(HUDProtocol):
             return None
 
     def begin_human_choice(self, agent_id: str, actions: list[ActionDescriptor]) -> None:
+        self._force = True
         self.actionbar.begin(agent_id, actions)
 
     def end_human_choice(self) -> None:
+        self._force = True
         self.actionbar.end_choice()
 
     # ================================================================= helpers used by components

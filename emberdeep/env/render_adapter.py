@@ -160,18 +160,19 @@ class FrameBuilder:
         active = w.active == c.eid and not w.done
         dead = bool(status & int(S.DEAD))
         return EntityView(
-            id=c.eid, kind="creature", name=c.name, x=int(c.x), y=int(c.y), z=int(c.z), size=int(c.size_sq),
+            id=c.eid, kind="creature", name=c.name, x=int(c.x), y=int(c.y), z=max(0, int(c.z)), size=int(c.size_sq),
             template=c.template_id, icon=icon, faction=int(c.faction), tint=tuple(int(v) for v in tint),
             agent_id=agent, controller=ctrl, hp=int(c.hp), max_hp=int(c.max_hp), temp_hp=int(c.temp_hp),
             ac=int(R.compute_ac(w, c)), level=int(c.level) if c.is_pc else 0, cr=float(c.cr),
             class_name=cls_name, race_name=c.race or "", conditions=_cond_names(int(c.cond_mask)),
-            effects=[e.ID for e in c.effects], statuses=_status_names(status),
+            effects=[e.ID for e in c.effects] + (["burrowed"] if c.z < 0 else []), statuses=_status_names(status),
             concentration=(c.concentration.spell_id if c.concentration is not None else None),
             alive=not dead, downed=bool(status & int(S.DYING | S.STABLE)) and not dead, dead=dead,
             hidden=bool(status & int(S.HIDDEN)), death_saves=(int(c.death_succ), int(c.death_fail)),
             speed=int(speed), movement_left=int(c.ts.movement_left) if active else 0, resources=res,
             gold=int(c.gold), inventory=[(i.name if i.qty == 1 else f"{i.name} x{i.qty}") for i in c.inventory],
-            light=(tuple(c.light) if c.light is not None else None), facing=0.0, stats=stats)
+            light=(tuple(c.light) if c.light is not None else None), facing=0.0, stats=stats,
+            mounted_on=int(c.mount))
 
     def object_view(self, o) -> EntityView:
         k = int(o.kind)
@@ -193,6 +194,7 @@ class FrameBuilder:
             kind, state = "altar", f"{o.charges}/{o.max_charges}" if o.max_charges else ""
         else:
             kind = "exit"
+            state = "sealed" if getattr(o, "sealed", False) else ""
         return EntityView(id=o.eid, kind=kind, name=o.name, x=int(o.x), y=int(o.y), icon=icon, state=state,
                           value_gp=value)
 

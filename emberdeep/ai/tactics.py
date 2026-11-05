@@ -41,7 +41,15 @@ def mobile(sc: Scene) -> bool:
 
 def cost_grids(sc: Scene):
     """(approach cost grid, walk cost grid) in feet; both block hostile creatures, ``walk`` also blocks allies."""
+    if sc.grids is not None:
+        return sc.grids
     w, c = sc.w, sc.c
+    tm = turn_mem(w, c)
+    gk = (w.map.move_version, c.cond_mask, c.size_sq, c.z)
+    g = tm.get("grids")
+    if g is not None and g[0] == gk:           # nothing but ourselves moved since the last act of this turn
+        sc.grids = g[1]
+        return g[1]
     cost_ap = w._approach_cost(c)
     cost_wk = cost_ap.copy()
     for o in w.creatures:
@@ -66,6 +74,8 @@ def cost_grids(sc: Scene):
                 if 0 <= x < w.map.W and 0 <= y < w.map.H and (x, y) != (c.x, c.y):
                     cost_wk[y, x] = _INF
                     cost_ap[y, x] = _INF
+    sc.grids = (cost_ap, cost_wk)      # shared, read-only by convention (callers copy before modifying)
+    turn_remember(w, c, grids=(gk, sc.grids))
     return cost_ap, cost_wk
 
 
@@ -146,8 +156,9 @@ def evaluate_cells(sc: Scene, prof, sv: Survey, dist_wk: np.ndarray, urgency: fl
     ys, xs = np.nonzero(reach_m)
     if len(xs) <= 1:
         return None
-    if len(xs) > 64:                     # thin the candidate set (checkerboard) -- keep the current cell
-        keep = ((xs ^ ys) & 1 == 0) | ((xs == c.x) & (ys == c.y))
+    if len(xs) > 30:                     # thin the candidate set to a 2x2 lattice (+ the neighbourhood of the current cell)
+        near = (np.abs(xs - c.x) <= 1) & (np.abs(ys - c.y) <= 1)
+        keep = (((xs & 1) == 0) & ((ys & 1) == 0)) | near
         xs, ys = xs[keep], ys[keep]
     cx = xs.astype(np.int32)
     cy = ys.astype(np.int32)
@@ -155,62 +166,75 @@ def evaluate_cells(sc: Scene, prof, sv: Survey, dist_wk: np.ndarray, urgency: fl
     n = len(cx)
     known = sc.known_foes()
     F = len(known)
-    safety = prof.safety + 2.5 * urgency
+    fatigue = min(1.0, max(0.0, (w.round - 10) / 10.0))      # long fights: stop kiting forever
+    safety = (prof.safety + 2.5 * urgency) * (1.0 - 0.85 * fatigue)
     off_w = 1.0 - 0.75 * urgency
     S_ = np.zeros(n, dtype=np.float32)
     if F:
-        FX = np.fromiter((k[1] for k in known), np.int32, F)
-        FY = np.fromiter((k[2] for k in known), np.int32, F)
-        FS = np.fromiter((k[0].size_sq for k in known), np.int32, F)
-        dx = np.maximum(np.maximum(FX[None, :] - cx[:, None], cx[:, None] - (FX[None, :] + FS[None, :] - 1)), 0)
-        dy = np.maximum(np.maximum(FY[None, :] - cy[:, None], cy[:, None] - (FY[None, :] + FS[None, :] - 1)), 0)
+        # per-foe scalars gathered once in plain Python; every cell x foe operation below is one numpy call
+        FX = np.empty(F, np.int32)
+        FY = np.empty(F, np.int32)
+        FS = np.empty(F, np.int32)
+        m = np.empty(F, np.float32)
+        r = np.empty(F, np.float32)
+        thr_m = np.empty(F, np.int32)
+        thr_r = np.empty(F, np.int32)
+        thr_l = np.empty(F, np.int32)
+        oa_w = np.zeros(F, np.float32)
+        oa_reach = np.zeros(F, np.int32)
+        pm = np.zeros(F, np.float32)
+        preach = np.zeros(F, np.int32)
+        pr = np.zeros(F, np.float32)
+        prng = np.zeros(F, np.int32)
+        prngl = np.zeros(F, np.int32)
+        fl_reach = np.zeros(F, np.int32)
+        fl_on = np.zeros(F, bool)
+        offs = []
+        dis = c.ts.disengaged or c.status & S.DISENGAGED or not w.rules.opportunity_attacks or no_oa
+        wgt = max(prof.flank_w, 1.0 if prof.pack else 0.0) if (prof.flank_w or prof.pack) else 0.0
+        allies = sc.allies
+        for j, (f, fx, fy, vis) in enumerate(known):
+            o = sc.offense(f)
+            offs.append(o)
+            FX[j], FY[j], FS[j] = fx, fy, f.size_sq
+            m[j], r[j] = o["m"], o["r"]
+            thr_m[j], thr_r[j], thr_l[j] = o["spd"] + o["reach"], o["rng"], o["rngl"]
+            if vis:
+                if not dis and f.reaction_available and not f.cond_mask & INCAP_MASK and o["m"] > 0 \
+                        and sc.dist(f) <= o["reach"]:
+                    oa_w[j] = 0.55 * o["m"]
+                    oa_reach[j] = o["reach"]
+                p = sv.pot.get(f.eid)
+                if p is not None:
+                    pm[j], preach[j] = p.mval, p.reach
+                    pr[j], prng[j], prngl[j] = p.rval, p.rng, p.rngl
+                if wgt and any(sc.dist2(a, f) <= 1 and not a.cond_mask & INCAP_MASK for a in allies):
+                    fl_on[j] = True
+                    fl_reach[j] = max(1, p.reach if p is not None else 1)
+        cxc = cx[:, None]
+        cyc = cy[:, None]
+        dx = np.maximum(np.maximum(FX - cxc, cxc - (FX + FS - 1)), 0)
+        dy = np.maximum(np.maximum(FY - cyc, cyc - (FY + FS - 1)), 0)
         Dm = np.maximum(dx, dy)
         dmin = Dm.min(axis=1)
-        offs = [sc.offense(k[0]) for k in known]
-        m = np.array([o["m"] for o in offs], np.float32)
-        r = np.array([o["r"] for o in offs], np.float32)
-        thr_m = np.array([o["spd"] + o["reach"] for o in offs], np.int32)
-        thr_r = np.array([o["rng"] for o in offs], np.int32)
-        thr_l = np.array([o["rngl"] for o in offs], np.int32)
-        risk_m = np.where(Dm <= thr_m[None, :], m[None, :], 0.0)
-        risk_r = np.where(Dm <= thr_r[None, :], r[None, :], np.where(Dm <= thr_l[None, :], 0.6 * r[None, :], 0.0))
+        risk_m = np.where(Dm <= thr_m, m, 0.0)
+        risk_r = np.where(Dm <= thr_r, r, np.where(Dm <= thr_l, 0.6 * r, 0.0))
         risk = np.maximum(risk_m, risk_r).sum(axis=1)
         # opportunity attacks: foes that currently threaten us in melee and would not at the destination
-        oa = np.zeros(n, np.float32)
-        dis = c.ts.disengaged or c.status & S.DISENGAGED or not w.rules.opportunity_attacks
-        if not dis:
-            for j, (f, fx, fy, vis) in enumerate(known):
-                if not vis or not f.reaction_available or f.cond_mask & INCAP_MASK:
-                    continue
-                reach_j = offs[j]["reach"]
-                if sc.dist(f) <= reach_j and offs[j]["m"] > 0:
-                    oa += np.where(Dm[:, j] > reach_j, 0.55 * offs[j]["m"], 0.0)
+        oa = ((Dm > oa_reach) * oa_w).sum(axis=1) if oa_w.any() else np.zeros(n, np.float32)
         # offence potential
-        off = np.zeros(n, np.float32)
-        for j, (f, fx, fy, vis) in enumerate(known):
-            p = sv.pot.get(f.eid)
-            if p is None or not vis:
-                continue
-            if p.mval > 0:
-                off = np.maximum(off, np.where(Dm[:, j] <= p.reach, p.mval, 0.0))
-            if p.rval > 0:
-                v = np.where(Dm[:, j] <= p.rng, p.rval, np.where(Dm[:, j] <= p.rngl, 0.7 * p.rval, 0.0))
-                v = np.where(dmin <= 1, v * 0.55, v)
-                off = np.maximum(off, v)
+        off = np.where(Dm <= preach, pm, 0.0).max(axis=1)
+        if pr.any():
+            v = np.where(Dm <= prng, pr, np.where(Dm <= prngl, 0.7 * pr, 0.0)).max(axis=1)
+            v = np.where(dmin <= 1, v * 0.55, v)
+            off = np.maximum(off, v)
         # flanking / pack tactics / sneak attack: foes with an ally next to them
-        flank = np.zeros(n, np.float32)
-        if prof.flank_w or prof.pack:
-            wgt = max(prof.flank_w, 1.0 if prof.pack else 0.0)
-            for j, (f, fx, fy, vis) in enumerate(known):
-                if not vis:
-                    continue
-                if any(w.distance(a.eid, f.eid) <= 1 and not a.cond_mask & INCAP_MASK for a in sc.allies):
-                    flank = np.maximum(flank, np.where(Dm[:, j] <= max(1, sv.pot[f.eid].reach if f.eid in sv.pot
-                                                                       else 1), 2.2 * wgt, 0.0))
+        flank = np.where((Dm <= fl_reach) & fl_on, 2.2 * wgt, 0.0).max(axis=1) if fl_on.any() else 0.0
         S_ += off * off_w + flank - safety * risk - (0.0 if no_oa else oa)
         # preferred band
         if prof.band is not None:
             lo, hi = prof.band
+            lo = lo * (1.0 - fatigue) + fatigue
             lo2 = lo + 1.5 * urgency
             pen = np.maximum(0, lo2 - dmin) + np.maximum(0, dmin - hi)
             S_ -= 0.6 * pen
@@ -326,6 +350,8 @@ def step_toward(sc: Scene, dist_wk, cost_wk, tx: int, ty: int) -> Act | None:
         nx, ny = int(path[0][0]), int(path[0][1])
         d = _DIR_INDEX.get((nx - c.x, ny - c.y))
         if d is not None and mm[d] and not (fear and w._frightened_blocks(c, nx - c.x, ny - c.y)):
+            if len(path) > 1:           # remember the rest of the route: next acts of this turn skip the analysis
+                turn_remember(w, c, path=(tuple((int(p[0]), int(p[1])) for p in path[1:]), c.hp))
             return Act(ActKind.MOVE, d)
     # fallback: legal neighbour closest to the goal (distance field from the goal, friends passable)
     gc = w._approach_cost(c)
@@ -353,11 +379,9 @@ def escape_ability(sc: Scene, *, bonus_only: bool = False):
     mask = sc.mask()
     best = None
     for k in range(len(abil)):
-        if not mask[k]:
-            continue
         ab = abil[k]
         inf = info(ab)
-        if inf.role != "escape":
+        if inf.role != "escape" or not mask[k]:
             continue
         low = ab.id
         if "disengage" in low or inf.stance == "escape":
@@ -378,11 +402,9 @@ def hide_ability(sc: Scene):
     mask = sc.mask()
     best = None
     for k in range(len(abil)):
-        if not mask[k]:
-            continue
         ab = abil[k]
         inf = info(ab)
-        if inf.role == "escape" and (ab.id == "hide" or "hide" in ab.id):
+        if inf.role == "escape" and (ab.id == "hide" or "hide" in ab.id) and mask[k]:
             sc_ = (1 if inf.bonus else 0, -k)
             if best is None or sc_ > best[0]:
                 best = (sc_, k, inf)
@@ -396,11 +418,9 @@ def teleport_cands(sc: Scene, prof, sv: Survey, urgency: float, goal=None) -> li
     mask = sc.mask()
     out = []
     for k in range(len(abil)):
-        if not mask[k]:
-            continue
         ab = abil[k]
         inf = info(ab)
-        if inf.role != "teleport" or ab.target != TargetType.POINT:
+        if inf.role != "teleport" or ab.target != TargetType.POINT or not mask[k]:
             continue
         rng = max(1, ab.range_sq or 6)
         H, W = w.map.H, w.map.W
@@ -444,6 +464,11 @@ def plan_move(sc: Scene, prof, sv: Survey, best_now: Cand | None, urgency: float
     c, w = sc.c, sc.w
     out: list[Cand] = []
     base = best_now.score if best_now is not None else 0.0
+    if best_now is None and not sv.pot and not sv.heal_pot:
+        nm0 = (c.x, c.y, c.ts.action_used, c.ts.bonus_used, len(sc.standing), c.hp, c.ts.movement_left, urgency)
+        if turn_mem(w, c).get("idle0") == nm0:
+            return out                      # identical situation, and nothing came of it a moment ago
+        turn_remember(w, c, idle0=nm0)
     # --- teleports (misty step) for creatures that want out of melee --------------------------------------------
     if (urgency > 0 or (prof.kite and _adjacent_foe(sc))) and sc.known_foes():
         out.extend(teleport_cands(sc, prof, sv, urgency, goal))
@@ -480,8 +505,11 @@ def plan_move(sc: Scene, prof, sv: Survey, best_now: Cand | None, urgency: float
     if shoot_first:
         return out           # a good shot is available and nothing is in our face: shoot, reposition afterwards
     if not melee_style or urgency > 0 or prof.flank_w or prof.pack or prof.safety > 0 or prof.ally_w:
-        dist_wk = geo.dijkstra(cost_wk, c.x, c.y, ml, rule)
         tm = turn_mem(w, c)
+        nm = (c.x, c.y, c.ts.action_used, c.ts.bonus_used, len(sc.standing), c.hp, c.ts.movement_left)
+        if tm.get("nomove") == nm:
+            return out                      # same situation as the last act of this turn, which found nothing to do
+        dist_wk = geo.dijkstra(cost_wk, c.x, c.y, ml, rule)
         phase = (c.ts.action_used, c.ts.bonus_used, len(sc.standing), c.hp, c.ts.disengaged)
         pd = tm.get("dest")
         if pd is not None and pd[3] == phase and (pd[0], pd[1]) != (c.x, c.y) and dist_wk[pd[1], pd[0]] <= ml:
@@ -510,6 +538,8 @@ def plan_move(sc: Scene, prof, sv: Survey, best_now: Cand | None, urgency: float
                 if step is not None:
                     out.append(Cand(gain, step, f"move>({tx},{ty})"))
                     turn_remember(w, c, dest=(tx, ty, gain, phase))
+                    return out
+        turn_remember(w, c, nomove=nm)
     return out
 
 

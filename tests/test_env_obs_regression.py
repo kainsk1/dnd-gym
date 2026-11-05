@@ -1,4 +1,7 @@
-"""(Golden values re-baselined after the once-per-turn FREE ability rule.)
+"""(Golden values re-baselined after the once-per-turn FREE ability rule, and again for v1.1.)
+v1.1 re-baseline (rules-engine): digests changed because of intentional rules semantics - low walls are climbable obstacles,
+carrying-capacity speed limits (coins weigh 1 lb / 50), attunement-gated items, stable recovery, underwater / projectile
+rules, mounts, new RulesConfig fields, extra RNG draws; status block grew 18 -> 22 bits (MOUNTED, CARRYING_RIDER, SQUEEZING, BURROWED).  Observation/action layout is unchanged.
 Bit-identity regression: observation / mask / reward digests for fixed seeds and action sequences.
 
 These golden values pin the observation and action semantics; performance work must not change them.
@@ -13,10 +16,10 @@ from helpers_env import clean_defs  # noqa: F401 (autouse fixture)
 
 CASES = [("goblin_ambush", 3, 90), ("dragon_hoard", 5, 60), ("skirmish_2v2", 1, 60), ("cursed_coffer", 2, 60)]
 GOLDEN = {
-    ('goblin_ambush', 3, 90): '78328c08651a2a05',
-    ('dragon_hoard', 5, 60): 'dae9ec58c4728234',
-    ('skirmish_2v2', 1, 60): 'fb678df338900caf',
-    ('cursed_coffer', 2, 60): '9f7f1490a392b818',
+    ('goblin_ambush', 3, 90): '6fc9d1ab81d63aba',
+    ('dragon_hoard', 5, 60): '2ee77937f1237480',
+    ('skirmish_2v2', 1, 60): 'e16024d894e6740b',
+    ('cursed_coffer', 2, 60): '61e7e93451e2a94a',
 }
 
 

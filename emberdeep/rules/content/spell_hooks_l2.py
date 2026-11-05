@@ -391,7 +391,8 @@ def weapon_attack(world, caster, z, t, slot: int) -> None:
     sp = _spiritual_def()
     comps = [[_weapon_dice(slot, R.spell_mod(caster)), 4, True]]
     _move_weapon_beside(world, z, t)
-    spell_attack(world, caster, t, "Spiritual Weapon", "spiritual_weapon", comps, AttackKind.MELEE_SPELL, None, sp)
+    spell_attack(world, caster, t, "Spiritual Weapon", "spiritual_weapon", comps, AttackKind.MELEE_SPELL, None, sp,
+                 extra={"from_weapon": True})
 
 
 def _spiritual_def():
@@ -423,6 +424,14 @@ class SpiritualWeaponSpell(SpellHook):
 
 @register_effect("spiritual_weapon_link")
 class SpiritualWeaponLink(GrantEffect):
+    """Grants the bonus-action attack.  The attack is made *by the weapon*: it flew next to the target, so distance and
+    cover are measured from the weapon (adjacent: no cover, melee against a prone target has advantage)."""
+    HOOKS = GrantEffect.HOOKS | frozenset({"on_attack_declared"})
+
+    def on_attack_declared(self, world, ctx):
+        if ctx.attacker.eid == self.me and ctx.extra.get("from_weapon"):
+            ctx.dist = 1
+            ctx.cover = 0
     ABILITY = ("spiritual_weapon_attack", "Spiritual Weapon", ActionCost.BONUS_ACTION, TargetType.ENEMY, 30,
                "spiritual_weapon", ("spell", "damage", "attack"))
 

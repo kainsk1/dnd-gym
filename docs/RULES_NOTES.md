@@ -26,7 +26,7 @@ atomic-action interface forces a simplification, the choice made by the engine i
   no movement and no usable action other than FREE abilities (give/truce/rest) and END_TURN. Creatures that are merely
   *able* to use a free object interaction keep their turn (the agent ends it).
 * **Dying creatures** roll their death save at the start of their turn automatically; stable creatures simply pass.
-  A stable creature does not regain 1 HP after an hour (no downtime clock).
+  A stable creature regains 1 HP after 1d4 hours (see v1.1 additions).
 * **Round counters.** Effect/zone durations count down at `ROUND_START`; conditions at the *end of the bearer's turn*;
   "until the end of X's next turn" is tracked per condition/effect with an *armed* flag so the turn in which it was
   applied does not count.
@@ -99,7 +99,7 @@ atomic-action interface forces a simplification, the choice made by the engine i
 ## Movement (§4.10)
 * Chebyshev metric by default; `rules.diagonal_rule = "5-10-5"` alternates 5/10 ft diagonals per turn. Difficult
   terrain, crawling, swimming without a swim speed, zone slowing and dragging a grappled creature each add +1 foot per foot
-  (additive, as in the SRD). Climbing speeds are not modelled (climb = walk on climbable terrain only).
+  (additive, as in the SRD). Climb speeds are modelled for low walls and burrow speeds underground (v1.1 additions).
 * A single MOVE never ends in an occupied square. `APPROACH` may *pass through* allied squares (and through hostile
   creatures two sizes apart) but never stops on one; it pathfinds with `pathing.dijkstra`, stops adjacent / at best
   reach, when movement runs out or on an interrupt (opportunity attack, trap, lava, newly started combat).
@@ -149,8 +149,25 @@ atomic-action interface forces a simplification, the choice made by the engine i
 * A wandering monster may appear after a rest (`wandering_monster_chance`, `wandering_monster_ids`).
 
 ## Not modelled
-Multiclassing, encumbrance, attunement limits, mounts, climb/burrow movement rules, underwater combat, vehicles, the
-1-hour stable-creature recovery, downtime, language barriers, and any non-SRD content.
+Vehicles, downtime, language barriers (out of scope), suffocation / holding breath, vertical climbing of cliffs/walls (maps are
+top-down: only low walls are climbable obstacles), high jumps (only long jumps over pits are automatic), tool proficiencies, and
+any non-SRD content.
+
+## v1.1b movement additions
+* **Squeezing.** A creature may enter a footprint that overlaps obstacles when its top-left (size-1)^2 squares are free (a Large
+  creature in a 1-wide corridor); it pays +1 foot per foot, has disadvantage on attack rolls and DEX saves and attackers have
+  advantage (`World.is_squeezing`). Amorphous oozes, air forms and swarms are exempt. The approach planner doubles the cost of
+  squeezed anchors.
+* **Incorporeal movement** (trait `incorporeal_movement`): walls, pillars, statues and closed doors are difficult terrain
+  (10 ft per square); pits, void and map edges still stop it. Ending the turn inside costs 1d10 force.
+* **Jumping.** A step into a pit square becomes a long jump when the creature has the distance (STR score ft with a 10-ft straight
+  run-up this turn, half standing; the Jump spell triples it) and the movement (5 ft per square travelled) and the landing square
+  is free in the same direction. The approach planner only plans jumps a creature can make from a standing start within its
+  remaining movement, so masked-in approaches always execute.
+* **Per-observer illusions.** `World.discern_illusion(zone, eid)`: Minor Illusion stays opaque for everybody except the creatures
+  that discerned it (`World.ext['illusion_seen']`).
+* **Sight radius.** Targets farther than `rules.sight_radius` (24 squares = 120 ft) cannot be seen, hence not targeted, even if
+  lit; long-range spells (Eldritch Spear 300 ft) need `sight_radius` raised in the scenario rules.
 
 ## Pass 2 additions (engine hooks and corrections)
 * **Movement/pathing.** `_step_cost`, `move_mask` and the approach planner share one rule set (only "both orthogonal
@@ -165,8 +182,67 @@ Multiclassing, encumbrance, attunement limits, mounts, climb/burrow movement rul
 * **Hooks added** (see `rules/registry.ALL_HOOKS`): `on_spawn`, `force_save_mods`, `after_d20`/`observe_d20`,
   `ally_save_mods`, `modify_healing`, `death_save_mods`, `veto_exhaustion`, `avoids_opportunity`, `can_pass_through`,
   `may_share_space`, `ignores_difficult`, `weapon_ability`, `ability_blocked`, `target_filter`, `economy_mods`,
-  `spell_range_mult`, `ignore_components`, `before_cast`, `on_fall`; `projectile_block` is declared but not yet
-  consulted by the engine (wind wall / gas barriers).
+  `spell_range_mult`, `ignore_components`, `before_cast`, `on_fall`; `projectile_block` is consulted for
+  ordinary ranged weapon attacks (see v1.1).
 * **Decisions** `SPELL_CHOICE` (spell hooks with `HAS_OPTIONS`) and `ON_FALL` (feather fall) were appended.
 * **World API**: `World.summon`, `add_to_order`, `round_hooks`, `ext`, `seal_exit`, `sync_items`; `CharacterBuild` is kept
   on the creature (`Creature.build`).
+
+## v1.1 additions (rules-engine)
+* **Multiclassing** (`CharacterBuild.classes = ((class_id, level, subclass), ...)`, first entry = primary; `level` = total).
+  Ability prerequisites (SRD table, `data.classes.MULTICLASS_PREREQS`) are enforced for *every* class once there are two
+  or more (`make_pc` raises `ValueError`; `multiclass_problems` lists violations). Saving throws and starting skills come
+  from the first class; later classes grant only `MULTICLASS_PROFICIENCIES` (armor/weapons, plus one skill for bard/ranger/rogue
+  via `choices['mc_skills']`). HP: first level of the first class is the maximum die, then each class's die; hit dice are kept
+  per die size (`fstate['hd_left'/'hd_max']`, largest die spent first, long rest regains half the total, largest first).
+  Proficiency bonus uses total level. Features follow class levels; a feature id shared by classes (Extra Attack, ASI) is
+  granted once, so Extra Attack does not stack; Unarmored Defense variants are AC bases and the best wins. Resources with the
+  same id (Channel Divinity) form one pool whose size is the sum of the grants. Spell slots: one spellcasting class -> its own
+  table; several -> combined Spellcaster level (full + half rounded down; no third-casters in this content set) on the
+  full-caster table; Warlock Pact Magic is separate, and pact and ordinary slots pay for each other's spells. Spells are
+  per class (`choices['class_spells'|'class_cantrips']`) and each spell uses the casting ability of its class
+  (`fstate['spell_abil']`, swapped in `cast_spell`). Concentration/zone DCs use the casting ability active when they were created.
+  Archetypes: `paladin_sorcerer`, `fighter_wizard`, `rogue_fighter`, `cleric_druid` (total level 2-5) and
+  `random_build(..., multiclass_prob=p)`.
+* **Carrying capacity.** STR x 15 lb (Tiny x0.5, Large x2, Huge x4, Gargantuan x8); push/drag/lift x2. Weights come from
+  item/weapon/armor defs; 50 coins = 1 lb. `RulesConfig.encumbrance`: `"capacity"` (default; over capacity -> speed 5 ft),
+  `"variant"` (> 5 x STR -10 ft; > 10 x STR -20 ft plus disadvantage on attacks, STR/DEX/CON checks and saves), `"off"`.
+  Picking up loot that over-encumbers is always allowed. Heavy armor with unmet STR still costs 10 ft.
+* **Attunement.** `ItemDef.attunement` items work only while `ItemInstance.attuned` (AC/save bonuses, worn effects,
+  wand/item abilities). Max 3 per creature. Items carried at spawn are attuned (worn/equipped first, then most valuable);
+  every short rest fills free slots with the most valuable unattuned items; `World.attune/unattune/auto_attune` are the API
+  (no action slot: the action space is unchanged). Transfers clear attunement. `RulesConfig.attunement=False` disables the rule.
+* **Stable creatures** regain 1 HP after 1d4 hours: the clock starts (rolls 1d4) the first time time passes (a rest) after
+  stabilising, ticks in rest rounds (1 h = 600 rounds), is dropped on damage / re-stabilising / healing.
+* **Underwater combat.** Attackers in deep water without a swim speed have disadvantage with melee weapons other than
+  dagger/javelin/shortsword/spear/trident; ranged weapon attacks beyond normal range auto-miss and have disadvantage
+  within it unless crossbow/net/javelin/spear/trident/dart; creatures in deep water resist fire. Spells are unaffected.
+* **Projectile / gas barriers.** Zones with `params['blocks_projectiles']` (Wind Wall), zone implementations with
+  `blocks_projectile(world, z, a, b)` and target `projectile_block` hooks make ordinary ranged weapon attacks that cross
+  them miss (segment-vs-cell test between square centres). Gas/fog zones (`fog_cloud`, `stinking_cloud`, `params['gas']`) do not
+  spread across `blocks_gas` zones. Sealed exits block flyers too and the render adapter reports `state='sealed'`.
+* **Climbing.** Low walls (`Terrain.LOW_WALL`) no longer block movement: crossing costs 10 ft per square (difficult terrain)
+  or 5 ft with a climb speed; they still give half cover. Statues, pillars and walls still block. Spider Climb
+  creatures simply have the climb speed (no ceilings).
+* **Burrowing.** Creatures with a burrow speed use DESCEND at z=0 to dig in (5 ft) and ASCEND to surface; `z=-1` means
+  burrowed: not on the ground occupancy grid, unseen except by tremorsense (both ways), immune to area effects, cannot target
+  others, tunnels only through diggable ground (dirt/sand/grass/cave floor/rubble/difficult terrain; stone floors and walls are
+  not) at `walk/burrow` x 5 ft per square; `earth_glide` creatures tunnel through stone and walls but never water/lava/pits.
+  Emerging needs a free walkable square. Stone dungeons are therefore mostly burrow-proof, as in the SRD.
+* **Mounted combat** (`RulesConfig.mounts`). Monsters tagged `mount` (warhorse, riding/draft horse, pony, mule, elk, giant elk,
+  giant eagle, griffon, hippogriff) can be ridden by an allied creature at least one size smaller within 5 ft via the
+  `mount` / `dismount` abilities (specific slots, appended last; they appear only in worlds that contain a mount; cost half the
+  rider's speed, no action). `mount_independent` mounts (giant elk, giant eagle) keep their own turns and AI and the rider
+  cannot move; all others are *controlled*: their turn is merged into the rider's, the rider's MOVE/APPROACH/ASCEND move the
+  mount using the mount's speed (the rider's pool mirrors the mount's; the rider's own pool is parked and restored on
+  dismount). Dash/Disengage/Dodge of the rider also apply to the controlled mount (deviation: they spend the rider's
+  action, not the mount's). The rider shares the mount's square (no ground occupancy of its own; distance to a rider is
+  measured from the mount's body). Opportunity attacks against a moving mount are aimed at the weaker of rider and mount. A mount
+  knocked prone makes the rider step off (reaction, land on feet) or fall prone; a prone rider needs a DEX save DC 10 to stay
+  seated; a mount moved against its will (forced movement, teleport) forces the same save; a downed/dead mount throws the rider
+  prone. Scenarios seat riders with the spawn tag `ride:<tag>` on the nearest allied mount carrying `<tag>` (`mounted_patrol`).
+  Events `MOUNT=74`, `DISMOUNT=75`; `EntityView.mounted_on`.
+* **Hooks / API.** `DecisionKind.POST_ROLL=12`, hooks `observe_damage`, `observe_hit_die`, zone `on_damage`; `projectile_block`
+  now consulted. New `RulesConfig` fields `encumbrance`, `attunement`, `mounts`. `ItemInstance.penalty` (corrosion) is honoured
+  in weapon damage; `ignores_difficult` and `may_share_space` (pass 2) cover per-creature terrain immunity and incorporeal /
+  swarm / engulfing creatures sharing squares. Turn-undead auras of allies (ghast) are content-side via `ally_save_mods`.

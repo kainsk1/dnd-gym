@@ -112,6 +112,9 @@ The full SRD 5.1 combat and exploration rules for character levels 1–5:
   interaction), opportunity attacks, cover, advantage & disadvantage, critical hits, resistances,
   all 14 conditions + exhaustion, death saves, grappling & shoving, hiding & searching, light and
   darkvision, flying altitude, hazards (lava, pits, deep water), traps, locks, short rests.
+* Multiclassing (SRD prerequisites, combined spell slots), carrying capacity & the encumbrance variant,
+  attunement (3 items), mounted combat (controlled & independent mounts), climbing, burrowing, swimming and
+  underwater combat, squeezing, long jumps, incorporeal movement, per-observer illusions.
 * Exploration and combat modes; doors, chests, levers, altars and exits.
 * **Social mechanics**: personal gold & items (pick up, give, administer potions), truce offers and
   acceptance, betrayal detection, parley & bribes with scripted factions, monster morale, flight and
@@ -133,6 +136,7 @@ Rules interpretations are documented in [docs/RULES_NOTES.md](docs/RULES_NOTES.m
 | `gladiator_pit` | 6 × 1 | free-for-all with temporary alliances, a shared threat and kingmaking |
 | `caravan_escort` | 4 | protection public good + bargaining: who pays the bandits' toll? |
 | `deep_delve` | 4 | procedural dungeon crawl (BSP / cave / crypt) for generalisation |
+| `mounted_patrol` | 3 | mounted knights (riders + warhorses) vs bandits — mounted-combat rules |
 | `duel`, `skirmish_2v2` | 2, 2 × 2 | micro self-play scenarios |
 
 Game-theoretic design: [docs/SCENARIO_DESIGN.md](docs/SCENARIO_DESIGN.md); details & knobs:
@@ -176,30 +180,32 @@ docs/                design, rules notes, API reference, content tables
 Architecture: [DESIGN.md](DESIGN.md). Rendering: [docs/RENDERING.md](docs/RENDERING.md),
 [docs/UI.md](docs/UI.md). AI: [docs/AI.md](docs/AI.md).
 
-## Performance & results (v1, measured on a shared 4-core cloud VM, Python 3.13, numba)
+## Performance & results (v1.1, shared 4-core cloud VM, Python 3.13, numba)
 
 | measurement | value |
 |---|---|
 | engine only (`world.step`, random legal actions, 4 PCs vs 6 goblins) | ~3,300 steps/s per core |
-| full AEC env step incl. observations & masks (`goblin_ambush`) | ~630 agent-steps/s per core |
-| 4-worker async vector env | ~800 agent-steps/s (scales with cores) |
+| full AEC env step incl. observations, masks and scripted monster turns (`goblin_ambush`) | ~1,000 agent-steps/s per core (v1.0: ~630) |
+| 4-worker async vector env | ~960 agent-steps/s (~1,300 with `waiting_obs="stale"`); scales with cores |
 | `world.clone()` (40×40 map, 12 creatures) | ~0.2 ms |
 | MAPPO on `goblin_ambush_small`, 8 min CPU | win rate 6% (random) → 73% sampled / 83% greedy |
 
-`python -m emberdeep.bench` reproduces the throughput numbers on your machine.
+Per agent step (≈ 1 ms): action masks ≈ 0.39 ms, observation ≈ 0.17 ms, engine step ≈ 0.14 ms, scripted
+monster AI ≈ 0.10 ms, bookkeeping the rest. `python -m emberdeep.bench` reproduces the numbers on your machine.
 
-## Known limitations (v1)
+## Known limitations (v1.1)
 
-* **Throughput** is below the 1,500 agent-steps/s/core design target: observation and action-mask
-  construction (~1.1 ms/step) dominates. A batched numba pipeline for masks/observations is the planned fix.
-* **Scripted baselines** occasionally run to the round limit in `caravan_escort` and `rival_delvers`
-  (≈ 5/10 and 4/10 seeds); learning agents are unaffected (episodes truncate cleanly).
-* **Rules gaps** (documented in docs/RULES_NOTES.md, docs/FEATURES.md, docs/SPELL_HOOKS.md,
-  docs/MONSTER_HOOKS.md): no multiclassing, encumbrance, attunement or mounts; Wind Wall does not yet block
-  projectiles; werewolf/wererat form-restricted attacks are not enforced; Mummy Rot is simplified; a few
-  metamagic options (Distant/Subtle/Careful-vs-conditions) and Bardic Inspiration timing are approximations.
-* **Art**: v1 uses procedural textures and game-icons.net silhouettes; v2 plans CC0 PBR textures,
-  animated 3D characters and a HUD polish pass.
+* **Throughput** is ~1,000 agent-steps/s per core, below the original 1,500 design target. The profile is now
+  flat (no single hotspot); reaching 1,500+ would need a compiled rewrite of the action-mask pipeline. Use the
+  vector env to scale across cores.
+* **Rules not modelled** (SRD material with little tactical effect, see docs/RULES_NOTES.md): gaps narrower
+  than a square, high jumps and monsters' bespoke jump distances, vertical cliffs and elevation terrain,
+  telepathy / languages, other planes, vehicles, downtime. Eldritch Spear's 300 ft reach is limited by
+  `rules.sight_radius` (default 120 ft; raise it in large outdoor maps).
+* **Scripted baselines** end the episode by objective / escape / defeat in ≥ 8/10 seeds in every scenario
+  (most 10/10); `gladiator_pit` is a survival design and can legitimately run to its round cap.
+* **Art**: procedural textures and game-icons.net silhouettes; v2 plans CC0 PBR textures, animated 3D
+  characters and a further HUD polish pass.
 
 ## Testing
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 
 from emberdeep.core import dice as D
+from emberdeep.core import zones as Z
 from emberdeep.core.decisions import DecisionOption, decide
 from emberdeep.core.entities import S, INCAP_MASK, ConditionInstance, LootPile
 from emberdeep.core.events import EventType as ET
@@ -126,7 +127,7 @@ def compute_ac(world, c) -> int:
         ac += (sd.base_ac if sd is not None else 2) + sh.bonus
     for slot in ("ring", "cloak", "amulet"):
         it = c.equipped.get(slot)
-        if it is not None:
+        if it is not None and it.active:
             ac += getattr(it.def_, "equip_ac_bonus", 0)
     for h in hooks(c, "ac_bonus"):
         ac += h.ac_bonus(world, c)
@@ -157,10 +158,46 @@ def weapon_def(it):
     return None
 
 
+SIZE_CAPACITY_MULT = {0: 0.5, 1: 1.0, 2: 1.0, 3: 2.0, 4: 4.0, 5: 8.0}
+
+
+def carrying_capacity(c) -> float:
+    """SRD carrying capacity in lb: STR x 15, multiplied by size (Tiny x0.5, Large x2, Huge x4, Gargantuan x8)."""
+    return c.scores[0] * 15 * SIZE_CAPACITY_MULT.get(int(c.size), 1.0)
+
+
+def push_drag_lift(c) -> float:
+    """SRD push / drag / lift limit: twice the carrying capacity."""
+    return 2 * carrying_capacity(c)
+
+
+def carried_weight(c) -> float:
+    """Weight in lb of everything carried (inventory stacks plus coins at 50 per lb)."""
+    w = 0.0
+    for it in c.inventory:
+        w += it.weight
+    return w + c.gold / 50.0
+
+
+def encumbrance_level(world, c) -> int:
+    """0 = unencumbered, 1 = encumbered (variant: > 5 x STR), 2 = heavily encumbered (variant: > 10 x STR) or, in the
+    default ``capacity`` mode, over carrying capacity."""
+    mode = world.rules.encumbrance
+    if mode == "off" or not c.inventory and not c.gold:
+        return 0
+    w = carried_weight(c)
+    scale = SIZE_CAPACITY_MULT.get(int(c.size), 1.0)
+    if mode == "variant":
+        s = c.scores[0] * scale
+        return 2 if w > 10 * s else (1 if w > 5 * s else 0)
+    return 2 if w > carrying_capacity(c) else 0
+
+
 def base_speed(world, c) -> int:
     """Best current movement speed in feet (before dash)."""
-    if c.speed_cache is not None:
+    if c.speed_cache is not None and c.speed_gold == c.gold:
         return c.speed_cache
+    c.speed_gold = c.gold
     m = c.cond_mask
     if m & _SPEED_ZERO or c.exhaustion >= 5:
         c.speed_cache = 0
@@ -180,6 +217,13 @@ def base_speed(world, c) -> int:
         sp = h.modify_speed(world, c, sp)
     if c.exhaustion >= 2:
         sp //= 2
+    enc = encumbrance_level(world, c)
+    c.enc_level = enc
+    if enc and sp > 0:
+        if world.rules.encumbrance == "variant":
+            sp = max(5, sp - (20 if enc == 2 else 10))
+        else:
+            sp = min(sp, 5)
     c.speed_cache = max(0, sp)
     return c.speed_cache
 
@@ -421,6 +465,8 @@ def _on_condition_gained(world, c, cond) -> None:
             world.clear_readied(c)
         if c.reaction_available and cond != CB.INCAPACITATED:
             pass
+    if cond == CB.PRONE and (c.rider >= 0 or c.mount >= 0):
+        world.on_prone_mounted(c)
     if c.z > 0 and not c.hover and cond in (CB.PRONE, CB.UNCONSCIOUS, CB.PARALYZED, CB.STUNNED, CB.PETRIFIED,
                                              CB.INCAPACITATED):
         world.fall(c)
@@ -555,6 +601,8 @@ def damage_multiplier(world, t, dtype: int, magical: bool, silvered: bool = Fals
     imm = bool(t.immune & bit)
     res = bool(t.resist & bit)
     vul = bool(t.vuln & bit)
+    if dtype == _FIRE_T and world.map.static.has_deep and in_deep_water(world, t):
+        res = True                                  # SRD Underwater Combat: fully immersed creatures resist fire
     if t.cond_mask & _PETRIFIED:                    # SRD: petrified creatures resist all damage, immune to poison
         res = True
         imm = imm or dtype == int(DamageType.POISON)
@@ -758,6 +806,10 @@ def saving_throw(world, saver, ability, dc: int, source=-1, name: str = "", is_s
             ctx.adv.append("dodge")
     if saver.exhaustion >= 3:
         ctx.dis.append("exhaustion")
+    if ability <= Ability.CON and world.rules.encumbrance == "variant" and encumbrance_level(world, saver) == 2:
+        ctx.dis.append("encumbered")
+    if ability == Ability.DEX and saver.size_sq > 1 and world.is_squeezing(saver):
+        ctx.dis.append("squeezing")
     if ability == Ability.DEX and m & _RESTRAINED:
         ctx.dis.append("restrained")
     for h in hooks(saver, "save_mods"):
@@ -783,7 +835,7 @@ def saving_throw(world, saver, ability, dc: int, source=-1, name: str = "", is_s
         total = roll + save_bonus(saver, ability) + ctx.bonus + _bonus_dice_total(world, ctx.bonus_dice)
         for it in ("ring", "cloak", "amulet"):
             e = saver.equipped.get(it)
-            if e is not None:
+            if e is not None and e.active:
                 total += getattr(e.def_, "equip_save_bonus", 0)
         ctx.roll, ctx.total = roll, total
         d = _after_d20(world, ctx, saver, roll, total)
@@ -810,6 +862,9 @@ def ability_check(world, c, skill, dc: int | None = None, ability=None, adv_extr
     ctx.bonus = bonus
     if c.exhaustion >= 1:
         ctx.dis.append("exhaustion")
+    if world.rules.encumbrance == "variant" and encumbrance_level(world, c) == 2:
+        if int(ctx.ability) <= 2:
+            ctx.dis.append("encumbered")
     if c.cond_mask & (_POISONED):
         ctx.dis.append("poisoned")
     if c.cond_mask & _FRIGHTENED:
@@ -822,7 +877,7 @@ def ability_check(world, c, skill, dc: int | None = None, ability=None, adv_extr
     for h in hooks(c, "check_mods"):
         h.check_mods(world, ctx)
     adv = net_adv(ctx.adv, ctx.dis)
-    ctx.dc = dc
+    ctx.dc = None if callable(dc) else dc
     roll, rolls = _roll_d20(world, adv, ctx.reroll_ones)
     if ctx.min_roll and roll < ctx.min_roll:
         roll = ctx.min_roll
@@ -834,6 +889,9 @@ def ability_check(world, c, skill, dc: int | None = None, ability=None, adv_extr
             b += ctx.proficient_mult * c.prof
     total = roll + b + ctx.bonus + _bonus_dice_total(world, ctx.bonus_dice)
     ctx.roll, ctx.total = roll, total
+    if callable(dc):                      # contests: the opponent's total is rolled once our d20 is known
+        dc = dc()
+        ctx.dc = dc
     d = _after_d20(world, ctx, c, roll, total)
     if d:
         total += d
@@ -849,11 +907,19 @@ def ability_check(world, c, skill, dc: int | None = None, ability=None, adv_extr
 
 def contest(world, a, skill_a, b, skill_b, purpose="", ties_to_a: bool = True, adv_a=(), dis_a=(), adv_b=(),
             dis_b=()) -> bool:
-    """Opposed checks; returns True if ``a`` wins (ties go to the attacker/initiator by default)."""
-    ta, _, _ = ability_check(world, a, skill_a, None, adv_extra=adv_a, dis_extra=dis_a, purpose=purpose,
+    """Opposed checks; returns True if ``a`` wins (ties go to the attacker/initiator by default).  The initiator rolls its
+    d20 first; the defender's total is then rolled (same dice order as ever) and handed to the initiator's post-roll hooks as
+    the number to beat, so a Bardic Inspiration die can be spent on a contest."""
+    box = []
+
+    def opposing():
+        tb, _, _ = ability_check(world, b, skill_b, None, adv_extra=adv_b, dis_extra=dis_b, purpose=purpose,
+                                 contest_with=a.eid)
+        box.append(tb)
+        return tb if ties_to_a else tb + 1
+    ta, _, _ = ability_check(world, a, skill_a, opposing, adv_extra=adv_a, dis_extra=dis_a, purpose=purpose,
                              contest_with=b.eid)
-    tb, _, _ = ability_check(world, b, skill_b, None, adv_extra=adv_b, dis_extra=dis_b, purpose=purpose,
-                             contest_with=a.eid)
+    tb = box[0]
     return ta > tb or (ta == tb and ties_to_a)
 
 
@@ -963,6 +1029,44 @@ def check_betrayal(world, attacker, target, area: bool = False) -> None:
 
 
 # =============================================================================== attacks
+_FIRE_T = int(DamageType.FIRE)
+UNDERWATER_MELEE_OK = frozenset({"dagger", "javelin", "shortsword", "spear", "trident"})
+UNDERWATER_RANGED_OK = frozenset({"light_crossbow", "hand_crossbow", "heavy_crossbow", "net", "javelin", "spear",
+                                  "trident", "dart"})
+
+
+def in_deep_water(world, c) -> bool:
+    """Is the (grounded) creature fully immersed (standing in a deep-water square)?"""
+    st = world.map.static
+    return c.z <= 0 and bool(st.deep[c.y:c.y + c.size_sq, c.x:c.x + c.size_sq].any()) if st.has_deep else False
+
+
+def _underwater_attack(world, ctx: AttackCtx) -> None:
+    """SRD Underwater Combat for weapon attacks made by a creature in deep water."""
+    a = ctx.attacker
+    if ctx.kind not in (AttackKind.MELEE_WEAPON, AttackKind.RANGED_WEAPON) or ctx.is_spell:
+        return
+    if not in_deep_water(world, a):
+        return
+    wid = ctx.weapon.id if ctx.weapon is not None else ""
+    if not ctx.ranged:
+        if a.speeds.get("swim", 0) <= 0 and (wid and wid not in UNDERWATER_MELEE_OK):
+            ctx.dis.append("underwater")
+    else:
+        if ctx.extra.get("long_range"):
+            ctx.extra["auto_miss"] = "underwater"
+        elif wid not in UNDERWATER_RANGED_OK:
+            ctx.dis.append("underwater")
+
+
+def _projectile_barrier(world, ctx: AttackCtx) -> None:
+    """Wind Wall & co: ordinary ranged weapon attacks whose path crosses a ``blocks_projectiles`` zone miss."""
+    if ctx.kind != AttackKind.RANGED_WEAPON or ctx.is_spell:
+        return
+    if world.projectile_blocked(ctx.attacker, ctx.target, ctx):
+        ctx.extra["auto_miss"] = "projectile_block"
+
+
 def gather_advantage(world, ctx: AttackCtx) -> None:
     """Fill ctx.adv / ctx.dis from SRD sources (conditions, positions, vision)."""
     a, t = ctx.attacker, ctx.target
@@ -992,6 +1096,12 @@ def gather_advantage(world, ctx: AttackCtx) -> None:
                 break
     if a.exhaustion >= 3:
         dis.append("exhaustion")
+    if a.size_sq > 1 and world.is_squeezing(a):            # squeezing: disadvantage on attacks, attacks against have advantage
+        dis.append("squeezing")
+    if t.size_sq > 1 and world.is_squeezing(t):
+        adv.append("target_squeezing")
+    if world.rules.encumbrance == "variant" and a.inventory and encumbrance_level(world, a) == 2:
+        dis.append("encumbered")
     if t.status & S.DODGING and not tm & INCAP_MASK and world.sees(t.eid, a.eid):
         dis.append("target_dodging")
     if ctx.ranged:
@@ -1003,6 +1113,10 @@ def gather_advantage(world, ctx: AttackCtx) -> None:
         adv.append("attacker_unseen")
     if not world.sees(a.eid, t.eid):
         dis.append("target_unseen")
+    if world.map.static.has_deep:
+        _underwater_attack(world, ctx)
+    if ctx.ranged and (world.zones or t.hooks):
+        _projectile_barrier(world, ctx)
     if world.rules.flanking and ctx.melee and ctx.dist <= 1 and t.size_sq == 1 and a.size_sq == 1:
         ox, oy = 2 * t.x - a.x, 2 * t.y - a.y
         o = world.occupant(ox, oy)
@@ -1014,7 +1128,17 @@ def gather_advantage(world, ctx: AttackCtx) -> None:
 
 
 def resolve_attack(world, ctx: AttackCtx, skip_protection: bool = False) -> AttackCtx:
-    """Full attack: roll, reactions, damage, on-hit effects, events.  Returns the context."""
+    """Full attack: roll, reactions, damage, on-hit effects, events.  Returns the context.  Afterwards the target's
+    ``after_attacked(world, ctx)`` hooks run whether the attack hit or missed (Giant Killer)."""
+    _resolve_attack(world, ctx, skip_protection)
+    t = ctx.target
+    if t.hooks and t.present and not t.status & S.DEAD:
+        for h in hooks(t, "after_attacked"):
+            h.after_attacked(world, ctx)
+    return ctx
+
+
+def _resolve_attack(world, ctx: AttackCtx, skip_protection: bool = False) -> AttackCtx:
     a, t = ctx.attacker, ctx.target
     ctx.dist = world.distance(a.eid, t.eid)
     ctx.cover = world.cover(a.eid, t.eid)
@@ -1051,6 +1175,8 @@ def resolve_attack(world, ctx: AttackCtx, skip_protection: bool = False) -> Atta
     hit = ctx.auto_hit or roll == 20 or (roll != 1 and total >= ac)
     if hit and not ctx.auto_hit and roll == 1:
         hit = False
+    if hit and ctx.extra.get("auto_miss"):
+        hit = False
     ctx.hit = hit
     ctx.crit = hit and (roll >= ctx.crit_min or ctx.auto_crit)
     # ON_ATTACKED decision (Shield, Uncanny Dodge, Cutting Words ...) when the attack would hit
@@ -1064,7 +1190,8 @@ def resolve_attack(world, ctx: AttackCtx, skip_protection: bool = False) -> Atta
             ac2 = compute_ac(world, t) + COVER_AC_BONUS[ctx.cover] + ctx.ac_bonus
             if ac2 != ac:
                 ctx.ac = ac = ac2
-                ctx.hit = hit = ctx.auto_hit or roll == 20 or (roll != 1 and total >= ac)
+                ctx.hit = hit = (ctx.auto_hit or roll == 20 or (roll != 1 and total >= ac)) and \
+                    not ctx.extra.get("auto_miss")
                 ctx.crit = hit and (roll >= ctx.crit_min or ctx.auto_crit)
     world.emit(ET.ATTACK, a.eid, t.eid, 0, int(ctx.kind),
                {"ability": ctx.ability_id, "name": ctx.name, "roll": roll, "rolls": rolls, "bonus": ctx.bonus,
@@ -1149,6 +1276,13 @@ def deal_damage(world, dctx: DamageCtx) -> int:
         raw = D.roll(rng, dice, crit=dctx.crit)
         if raw < 0:
             raw = 0
+        if a is not None and a is not t and dctx.attack is not None and raw > 0:
+            for o in world.creatures_with_hook("observe_damage"):
+                if o.present and o is not t and not o.status & S.DEAD:
+                    for h in hooks(o, "observe_damage"):
+                        red = int(h.observe_damage(world, dctx, raw) or 0)
+                        if red > 0:
+                            raw = max(0, raw - red)
         mult, label = damage_multiplier(world, t, dtype, magical or dctx.magical, dctx.silvered, dctx.adamantine)
         if dtype in dctx.resist_types and label != "immune":
             mult *= 0.5
@@ -1160,6 +1294,11 @@ def deal_damage(world, dctx: DamageCtx) -> int:
             amt = int(amt * dctx.mult)
         rows.append([raw, amt, dtype, label])
         total_after += amt
+    if world.zones and total_after > 0:                 # zone observers (Web burns when fire hits a creature inside)
+        for z in Z.creature_zones(world, t):
+            f = getattr(z.impl, "on_damage", None)
+            if f is not None:
+                f(world, z, dctx, rows)
     if dctx.flat_reduction and total_after > 0:
         red = dctx.flat_reduction
         for r in rows:
@@ -1271,6 +1410,11 @@ def drop_unconscious(world, t, killer_eid: int = -1) -> None:
         end_concentration(world, t, "unconscious")
     t.status &= ~int(S.HIDDEN)
     world.emit(ET.DOWNED, killer_eid, t.eid, 0, -1)
+    killer = world.entities[killer_eid] if killer_eid >= 0 else None
+    if killer is not None and hasattr(killer, "hooks") and killer is not t:
+        t.fstate["downed_by"] = {"k": killer_eid}                    # credited: no second on_kill when it dies later
+        for h in hooks(killer, "on_kill"):                            # "reduces a hostile creature to 0 hit points"
+            h.on_kill(world, killer, t)
     world.vis_dirty()
     world.on_downed(t)
 
@@ -1294,8 +1438,10 @@ def die(world, victim, killer_eid: int = -1, cause: str = "damage") -> None:
     killer = world.entities[killer_eid] if killer_eid >= 0 else None
     if killer is not None and hasattr(killer, "hooks"):
         killer.stat("kills")
-        for h in hooks(killer, "on_kill"):
-            h.on_kill(world, killer, victim)
+        if victim.fstate.get("downed_by", {}).get("k") != killer_eid:
+            for h in hooks(killer, "on_kill"):
+                h.on_kill(world, killer, victim)
+    victim.fstate.pop("downed_by", None)
     world.remove_from_play(victim, dead=True)
     world.on_death(victim, killer)
 
@@ -1339,6 +1485,7 @@ def revive(world, target, src=None) -> None:
 def stabilize(world, target, helper=None) -> None:
     target.status = (target.status | int(S.STABLE)) & ~int(S.DYING)
     target.death_succ = target.death_fail = 0
+    target.fstate.pop("stable_clock", None)
     world.emit(ET.STABILIZED, helper.eid if helper is not None else -1, target.eid)
 
 

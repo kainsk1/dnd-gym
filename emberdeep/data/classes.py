@@ -34,7 +34,9 @@ __all__ = [
     "LAND_TYPES", "LAND_CIRCLE_SPELLS", "ALWAYS_PREPARED_SUBCLASSES", "FULL_CASTER_SLOTS", "HALF_CASTER_SLOTS",
     "WARLOCK_PACT_SLOTS", "FAVORED_ENEMY_OPTIONS", "SpellCounts", "spell_counts", "spell_slots",
     "max_spell_level", "resource_max", "class_features_up_to", "subclass_features_up_to",
-    "bonus_spells_up_to", "WILD_SHAPE_FORMS", "MAX_LEVEL",
+    "bonus_spells_up_to", "WILD_SHAPE_FORMS", "MAX_LEVEL", "MULTICLASS_PREREQS", "MULTICLASS_PROFICIENCIES",
+    "MULTICLASS_SLOT_TABLE", "multiclass_prereqs_met", "multiclass_problems", "caster_level_contribution",
+    "multiclass_caster_level", "multiclass_slots",
 ]
 
 MAX_LEVEL = 20
@@ -817,3 +819,120 @@ def bonus_spells_up_to(subclass_id: str, level: int, land: str = "") -> tuple[st
 
 assert set(SPELL_IDS) >= {s for lst in CLASS_SPELL_LISTS.values() for s in lst}
 assert all(SPELL_LEVEL[s] <= 3 for lst in CLASS_SPELL_LISTS.values() for s in lst)
+
+
+# ----------------------------------------------------------------------------------------------
+# Multiclassing (SRD 5.1 "Multiclassing")
+# ----------------------------------------------------------------------------------------------
+# class -> (mode, ((ability, minimum), ...)); mode "all" = every ability must reach the minimum, "any" = one is enough.
+MULTICLASS_PREREQS: dict[str, tuple[str, tuple[tuple[A, int], ...]]] = {
+    "barbarian": ("all", ((A.STR, 13),)),
+    "bard": ("all", ((A.CHA, 13),)),
+    "cleric": ("all", ((A.WIS, 13),)),
+    "druid": ("all", ((A.WIS, 13),)),
+    "fighter": ("any", ((A.STR, 13), (A.DEX, 13))),
+    "monk": ("all", ((A.DEX, 13), (A.WIS, 13))),
+    "paladin": ("all", ((A.STR, 13), (A.CHA, 13))),
+    "ranger": ("all", ((A.DEX, 13), (A.WIS, 13))),
+    "rogue": ("all", ((A.DEX, 13),)),
+    "sorcerer": ("all", ((A.CHA, 13),)),
+    "warlock": ("all", ((A.CHA, 13),)),
+    "wizard": ("all", ((A.INT, 13),)),
+}
+
+# Proficiencies gained when a class is taken as a *non-first* class: (armor categories, weapon proficiencies,
+# number of skills picked from the class's skill list).  Tool proficiencies are not modelled (thieves' tools and
+# instruments are granted through items).
+MULTICLASS_PROFICIENCIES: dict[str, tuple[tuple[AR, ...], tuple[str, ...], int]] = {
+    "barbarian": ((AR.SHIELD,), ("simple", "martial"), 0),
+    "bard": ((AR.LIGHT,), (), 1),
+    "cleric": ((AR.LIGHT, AR.MEDIUM, AR.SHIELD), (), 0),
+    "druid": ((AR.LIGHT, AR.MEDIUM, AR.SHIELD), (), 0),
+    "fighter": ((AR.LIGHT, AR.MEDIUM, AR.SHIELD), ("simple", "martial"), 0),
+    "monk": ((), ("simple", "shortsword"), 0),
+    "paladin": ((AR.LIGHT, AR.MEDIUM, AR.SHIELD), ("simple", "martial"), 0),
+    "ranger": ((AR.LIGHT, AR.MEDIUM, AR.SHIELD), ("simple", "martial"), 1),
+    "rogue": ((AR.LIGHT,), (), 1),
+    "sorcerer": ((), (), 0),
+    "warlock": ((AR.LIGHT,), ("simple",), 0),
+    "wizard": ((), (), 0),
+}
+
+# Multiclass Spellcaster table: slots by combined caster level (identical to the full-caster progression).
+MULTICLASS_SLOT_TABLE = FULL_CASTER_SLOTS
+
+
+def multiclass_prereqs_met(class_id: str, scores) -> bool:
+    """Does ``scores`` (final STR..CHA) satisfy the ability prerequisites of ``class_id``?"""
+    mode, reqs = MULTICLASS_PREREQS[class_id]
+    ok = [scores[int(a)] >= n for a, n in reqs]
+    return all(ok) if mode == "all" else any(ok)
+
+
+def multiclass_problems(classes, scores) -> list[str]:
+    """Rule violations of a ``((class_id, level, subclass), ...)`` list: unknown classes, levels, duplicates, total
+    level above 20 and unmet ability prerequisites (every class, including the first, once there are several)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    total = 0
+    for cid, lv, _sub in classes:
+        if cid not in CLASSES:
+            out.append(f"unknown class '{cid}'")
+            continue
+        if cid in seen:
+            out.append(f"class '{cid}' listed twice")
+        seen.add(cid)
+        if lv < 1:
+            out.append(f"class '{cid}' needs at least one level")
+        total += lv
+    if total > MAX_LEVEL:
+        out.append(f"total level {total} exceeds {MAX_LEVEL}")
+    if len(classes) > 1:
+        for cid, _lv, _sub in classes:
+            if cid in CLASSES and not multiclass_prereqs_met(cid, scores):
+                mode, reqs = MULTICLASS_PREREQS[cid]
+                out.append(f"{cid} requires " + (" and " if mode == "all" else " or ").join(
+                    f"{a.name} {n}" for a, n in reqs))
+    return out
+
+
+def caster_level_contribution(class_id: str, level: int, subclass: str = "") -> int:
+    """Levels a class adds to the combined Spellcaster level (full = all, half = level // 2 rounded down; the
+    Eldritch Knight / Arcane Trickster third-casters do not exist in this content set; Pact Magic never counts)."""
+    sc = CLASSES[class_id].spellcasting
+    if sc is None or sc.kind == "pact":
+        return 0
+    if sc.kind == "full":
+        return level
+    if sc.kind == "half":
+        return level // 2
+    return level // 3                                   # "third"
+
+
+def multiclass_caster_level(classes) -> int:
+    return sum(caster_level_contribution(c, lv, sub) for c, lv, sub in classes)
+
+
+def multiclass_slots(classes) -> tuple[tuple[int, ...], tuple[int, int]]:
+    """(spell slots 1st..9th, (pact slot count, pact slot level)) for a list of ``(class_id, level, subclass)``.
+
+    With a single non-Pact spellcasting class its own table applies; with several the combined Spellcaster level
+    indexes :data:`MULTICLASS_SLOT_TABLE`.  Warlock Pact Magic slots are tracked separately."""
+    casters = [(c, lv) for c, lv, _ in classes
+               if CLASSES[c].spellcasting is not None and CLASSES[c].spellcasting.kind != "pact"
+               and (spell_slots(c, lv) != (0,) * 9 or caster_level_contribution(c, lv))]
+    pact = (0, 0)
+    for c, lv, _ in classes:
+        sc = CLASSES[c].spellcasting
+        if sc is not None and sc.kind == "pact":
+            pact = sc.pact_slots[min(lv, MAX_LEVEL)]
+    if not casters:
+        return (0,) * 9, pact
+    spellcasting_classes = [(c, lv) for c, lv, _ in classes
+                            if CLASSES[c].spellcasting is not None and CLASSES[c].spellcasting.kind != "pact"
+                            and (CLASSES[c].spellcasting.kind != "half" or lv >= 2)]
+    if len(spellcasting_classes) == 1:
+        c, lv = spellcasting_classes[0]
+        return tuple(spell_slots(c, lv)), pact
+    cl = min(MAX_LEVEL, multiclass_caster_level(classes))
+    return tuple(MULTICLASS_SLOT_TABLE[cl]), pact

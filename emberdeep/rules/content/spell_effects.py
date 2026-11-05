@@ -219,6 +219,25 @@ class CharmedFriend(SpellEffect):
         c = world.entities[self.me]
         if reason != "damaged":
             R.remove_conditions_from_source(world, c, Condition.CHARMED, self.source)
+        if 0 <= self.source < len(world.entities):
+            edge = EF.find_effect(world.entities[self.source], "charmer_edge")
+            if edge is not None:
+                edge.state["targets"] = tuple(t for t in edge.state.get("targets", ()) if t != self.me)
+                if not edge.state["targets"]:
+                    EF.remove_effect(world, world.entities[self.source], edge, "target_free")
+
+
+@register_effect("charmer_edge")
+class CharmerEdge(SpellEffect):
+    """Held by the charmer: advantage on any Charisma check made to interact socially with a creature it has charmed
+    (the CHARMED condition rule).  ``state['targets']`` are the eids of the charmed creatures."""
+    HOOKS = frozenset({"check_mods"})
+
+    def check_mods(self, world, ctx):
+        t = ctx.target
+        if ctx.checker.eid == self.me and t is not None and ctx.ability == Ability.CHA and not ctx.passive \
+                and t.eid in self.state.get("targets", ()):
+            ctx.adv.append("charmer")
 
 
 @register_effect("calm_emotions")
@@ -432,9 +451,12 @@ class RayOfEnfeeblement(SpellEffect):
 
 @register_effect("slow")
 class SlowEffect(SpellEffect):
-    """Slow: half speed, -2 AC and DEX saves, no reactions, a single attack per action, WIS save at each turn end."""
+    """Slow: half speed, -2 AC and DEX saves, no reactions, either an action or a bonus action (not both), a single
+    attack per turn, WIS save at each turn end.  Casting a 1-action spell: d20, 11+ delays it to the creature's next
+    turn (it must spend its action completing it) -- ``before_cast`` / ``on_turn_start``."""
     NO_REACTIONS = True
-    HOOKS = frozenset({"ac_bonus", "save_mods", "modify_speed", "on_turn_end", "on_attack_declared"})
+    HOOKS = frozenset({"ac_bonus", "save_mods", "modify_speed", "on_turn_end", "on_attack_declared", "economy_mods",
+                       "before_cast", "on_turn_start"})
 
     def ac_bonus(self, world, me):
         return -2
@@ -446,12 +468,42 @@ class SlowEffect(SpellEffect):
     def modify_speed(self, world, me, speed):
         return speed // 2
 
+    def economy_mods(self, world, me, ab):
+        """False forbids: an action-type ability after the bonus action (or the reverse)."""
+        ts = me.ts
+        if ab.cost in (ActionCost.ACTION, ActionCost.ATTACK):
+            return not ts.bonus_used
+        if ab.cost == ActionCost.BONUS_ACTION:
+            return not ts.action_used
+        return True
+
     def on_attack_declared(self, world, ctx):
-        if ctx.attacker.eid == self.me:                           # at most one attack per action
+        if ctx.attacker.eid == self.me:                           # at most one attack per turn
             ts = ctx.attacker.ts
             ts.attacks_left = 0
             if ts.mseq is not None:
                 ts.mseq = []
+
+    def before_cast(self, world, caster, spell, ctx):
+        if caster.eid != self.me or spell.casting_time != ActionCost.ACTION or ctx.free:
+            return
+        if D.d20(world.rng) >= 11:
+            ctx.extra["delayed"] = True
+            self.state["pending"] = (spell.id, ctx.slot, ctx.target, ctx.point, ctx.source)
+            world.emit(ET.LOG, self.me, -1, 0, -1, {"text": "slow: the spell is delayed", "level": 1, "spell": spell.id})
+
+    def on_turn_start(self, world, me):
+        pend = self.state.get("pending")
+        if not pend:
+            return
+        self.state["pending"] = None
+        from emberdeep.core.factory import lookup_spell
+        from emberdeep.rules import spells as SPL
+        sp = lookup_spell(pend[0])
+        if sp is None or not me.present or me.cond_mask & R.INCAP_MASK or me.ts.action_used:
+            return                                                   # cannot complete it: the spell is wasted
+        me.ts.action_used = True
+        SPL.cast_spell(world, me, sp, pend[1], pend[2], pend[3], slot_source="item", free=True)
 
     def on_turn_end(self, world, me):
         s = world.entities[self.source] if self.source >= 0 else None
@@ -805,6 +857,10 @@ class MirrorImage(SpellEffect):
             return
         n = self._n()
         thr = {3: 6, 2: 8, 1: 11}.get(n, 6)
+        if ctx.extra.get("estimate"):                      # expected value: redirected to an image with p = (21 - thr) / 20
+            t_ac = 10 + t.mods[1] - R.compute_ac(world, t)
+            ctx.extra.setdefault("est_mix", []).append(((21 - thr) / 20.0, t_ac, False))
+            return
         roll = D.d20(world.rng)
         if roll >= thr:
             img_ac = 10 + t.mods[1]
@@ -829,15 +885,31 @@ class MirrorImage(SpellEffect):
 
 @register_effect("sanctuary")
 class Sanctuary(SpellEffect):
-    """Sanctuary: an attacker must first win a WIS save or lose the attack; ends when the ward attacks or casts a
-    harmful spell."""
-    HOOKS = frozenset({"defense_mods", "on_attack_declared", "on_cast"})
+    """Sanctuary: a creature that targets the ward with an attack or a harmful (single-target) spell must first win a WIS
+    save or lose the attack / spell (engine hook ``on_targeted``); area effects are not stopped.  Ends when the ward
+    attacks or casts a harmful spell."""
+    HOOKS = frozenset({"defense_mods", "on_attack_declared", "on_cast", "on_targeted"})
+
+    def on_targeted(self, world, caster, spell, target):
+        if target.eid != self.me or caster.eid == self.me or spell.area is not None:
+            return True
+        harmful = bool(spell.damage or spell.attack or (spell.save is not None and not spell.healing)
+                       or set(spell.tags) & {"damage", "debuff", "control"})
+        if not harmful or world.relation(self.me, caster.eid) == Relation.ALLIED:
+            return True
+        src = world.entities[self.source] if self.source >= 0 else None
+        dc = R.spell_dc(src) if src is not None else 10
+        return R.saving_throw(world, caster, Ability.WIS, dc, self.source, name="sanctuary", is_spell=True)
 
     def defense_mods(self, world, ctx):
         if ctx.target.eid != self.me or ctx.attacker.eid == self.me:
             return
         src = world.entities[self.source] if self.source >= 0 else None
         dc = R.spell_dc(src) if src is not None else 10
+        if ctx.extra.get("estimate"):                      # expected value: the attack is lost with the save's failure chance
+            pf = min(0.95, max(0.05, (dc - R.save_bonus(ctx.attacker, Ability.WIS) - 1) / 20.0))
+            ctx.extra.setdefault("est_mix", []).append((pf, 0, True))
+            return
         ok = R.saving_throw(world, ctx.attacker, Ability.WIS, dc, self.source, name="sanctuary", is_spell=True)
         if not ok:
             ctx.ac_bonus += 1000

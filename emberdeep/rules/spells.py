@@ -114,9 +114,9 @@ def choose_slot(world, c, sp: SpellDef):
     return cands[0]
 
 
-def _bonus_rule_ok(c, sp) -> bool:
+def _bonus_rule_ok(c, sp, ct=None) -> bool:
     ts = c.ts
-    if sp.casting_time == AC.BONUS_ACTION:
+    if (ct if ct is not None else sp.casting_time) == AC.BONUS_ACTION:
         return not ts.cast_action_spell
     if sp.level > 0 and ts.cast_leveled_bonus_spell:
         return False
@@ -141,12 +141,21 @@ def _components_ok(world, c, sp) -> bool:
     return True
 
 
+def effective_casting_time(world, c, sp: SpellDef):
+    """Casting time after ``casting_time(world, caster, spell) -> ActionCost | None`` hooks (Quickened Spell)."""
+    for h in R.hooks(c, "casting_time"):
+        r = h.casting_time(world, c, sp)
+        if r is not None:
+            return r
+    return sp.casting_time
+
+
 def can_cast(world, c, sp: SpellDef, ab=None) -> bool:
     from emberdeep.core.abilities import can_act
     if c.status & S.SURRENDERED or not can_act(c):
         return False
     ts = c.ts
-    ct = sp.casting_time
+    ct = effective_casting_time(world, c, sp)
     if ct == AC.ACTION:
         if ts.action_used:
             return False
@@ -158,7 +167,7 @@ def can_cast(world, c, sp: SpellDef, ab=None) -> bool:
             return False
     elif ct == AC.REACTION:
         return False
-    if not _bonus_rule_ok(c, sp):
+    if not _bonus_rule_ok(c, sp, ct):
         return False
     if not _components_ok(world, c, sp):
         return False
@@ -374,7 +383,7 @@ def creatures_in_cells(world, cells, include_downed=True):
     for c in world.creatures:
         if not c.present:
             continue
-        if c.status & S.DEAD:
+        if c.status & S.DEAD or c.z < 0:                  # burrowed creatures are below every area effect
             continue
         if c.size_sq == 1:
             if (c.x, c.y) in cs:
@@ -451,7 +460,24 @@ def _resolve_targets(world, ctx) -> list:
 # =============================================================================== casting
 def cast_spell(world, caster, sp: SpellDef, slot_level: int | None, target_eid: int = -1, point=None, *,
                ability=None, slot_source: str | None = None, free: bool = False):
-    """Cast ``sp`` (see module docstring).  ``slot_level`` None -> chosen by ``choose_slot``."""
+    """Cast ``sp`` (see module docstring).  ``slot_level`` None -> chosen by ``choose_slot``.
+
+    Multiclass casters use the casting ability of the class that supplies the spell (``fstate['spell_abil']``)."""
+    over = caster.fstate.get("spell_abil")
+    if over and sp.id in over and caster.spell_ability is not None and int(caster.spell_ability) != over[sp.id]:
+        saved = caster.spell_ability
+        caster.spell_ability = Ability(over[sp.id])
+        try:
+            return _cast_spell(world, caster, sp, slot_level, target_eid, point, ability=ability,
+                               slot_source=slot_source, free=free)
+        finally:
+            caster.spell_ability = saved
+    return _cast_spell(world, caster, sp, slot_level, target_eid, point, ability=ability, slot_source=slot_source,
+                       free=free)
+
+
+def _cast_spell(world, caster, sp: SpellDef, slot_level: int | None, target_eid: int = -1, point=None, *,
+                ability=None, slot_source: str | None = None, free: bool = False):
     if slot_level is None or slot_source is None:
         slot_level, slot_source = choose_slot(world, caster, sp)
         if slot_level is None:
@@ -460,9 +486,15 @@ def cast_spell(world, caster, sp: SpellDef, slot_level: int | None, target_eid: 
     ctx = SpellCtx(caster, sp, slot, target_eid, point, ability, free, slot_source)
     if _components_ignored(world, caster, sp):
         ctx.extra["subtle"] = True
+    if ctx.casting_time is None:
+        ct = effective_casting_time(world, caster, sp)
+        if ct != sp.casting_time:
+            ctx.casting_time = ct
     for h in R.hooks(caster, "before_cast"):
         h.before_cast(world, caster, sp, ctx)
     _pay(world, caster, sp, slot, slot_source, free, ctx.casting_time)
+    if ctx.extra.get("delayed"):                       # Slow: the spell takes effect on the caster's next turn
+        return ctx
     if caster.status & S.HIDDEN:
         world.reveal(caster, "cast")
     if caster.effects:
@@ -511,6 +543,18 @@ def cast_spell(world, caster, sp: SpellDef, slot_level: int | None, target_eid: 
         ctx.targets = []
     else:
         ctx.targets = _resolve_targets(world, ctx)
+    if ctx.targets:                                   # Sanctuary & co.: targets may veto being targeted
+        kept = []
+        vetoed = False
+        for t in ctx.targets:
+            if t is not caster and t.hooks and not all(h.on_targeted(world, caster, sp, t)
+                                                       for h in R.hooks(t, "on_targeted")):
+                vetoed = True
+                continue
+            kept.append(t)
+        ctx.targets = kept
+        if vetoed and not kept:
+            ctx.extra["lost"] = True
     tids = [t.eid for t in ctx.targets]
     adata = None
     if area is not None:
@@ -522,9 +566,10 @@ def cast_spell(world, caster, sp: SpellDef, slot_level: int | None, target_eid: 
     for t in ctx.targets:
         if t.eid != caster.eid and sp.save or sp.attack:
             pass
+    uid0 = world._uid
     # --- hook
-    handled = False
-    if sp.hook:
+    handled = bool(ctx.extra.get("lost"))            # every target refused (Sanctuary): the spell is lost
+    if sp.hook and not handled:
         impl = SPELL_HOOKS.get(sp.hook)
         if impl is None:
             warn_once(f"spell hook '{sp.hook}' ({sp.id}) not registered; generic interpretation only")
@@ -532,9 +577,26 @@ def cast_spell(world, caster, sp: SpellDef, slot_level: int | None, target_eid: 
             handled = bool(impl().cast(world, ctx))
     if not handled:
         _generic(world, ctx)
+    _record_spell_conditions(world, caster, sp, slot, uid0)
     for h in R.hooks(caster, "on_cast"):
         h.on_cast(world, caster, sp, slot)
     return ctx
+
+
+def _record_spell_conditions(world, caster, sp, slot, uid0: int) -> None:
+    """Conditions a spell just put on creatures without a concentration link are remembered (``fstate['spell_conds']``:
+    condition uid -> (spell id, slot)) so that Dispel Magic can end them."""
+    if world._uid == uid0:
+        return
+    for o in world.creatures:
+        if not o.conditions:
+            continue
+        new = {ci.uid: (sp.id, slot) for lst in o.conditions.values() for ci in lst
+               if ci.uid > uid0 and ci.source == caster.eid and not ci.link}
+        if new:
+            d = dict(o.fstate.get("spell_conds", {}))
+            d.update(new)
+            o.fstate["spell_conds"] = d
 
 
 def _betray_targets(world, ctx, harmful: bool) -> None:

@@ -63,6 +63,44 @@ class Zone:
         return any(p in cs for p in c.cells())
 
 
+def segment_hits_cell(x0: float, y0: float, x1: float, y1: float, cx: int, cy: int) -> bool:
+    """Does the segment (x0,y0)-(x1,y1) (continuous coordinates, cell (cx,cy) spans [cx,cx+1) x [cy,cy+1)) touch the
+    interior of the cell?  Liang-Barsky slab test."""
+    t0, t1 = 0.0, 1.0
+    dx, dy = x1 - x0, y1 - y0
+    for p, q in ((-dx, x0 - cx), (dx, cx + 1 - x0), (-dy, y0 - cy), (dy, cy + 1 - y0)):
+        if p == 0:
+            if q <= 0:
+                return False
+        else:
+            r = q / p
+            if p < 0:
+                if r > t1:
+                    return False
+                if r > t0:
+                    t0 = r
+            else:
+                if r < t0:
+                    return False
+                if r < t1:
+                    t1 = r
+    return t1 - t0 > 1e-9
+
+
+def segment_crosses_zone(world, z: "Zone", a, b, ignore_cells=()) -> bool:
+    """Does the line from the centre of ``a`` to the centre of ``b`` cross a cell of ``z``?"""
+    ax, ay = a.x + a.size_sq / 2.0, a.y + a.size_sq / 2.0
+    bx, by = b.x + b.size_sq / 2.0, b.y + b.size_sq / 2.0
+    lo_x, hi_x = min(ax, bx) - 1, max(ax, bx) + 1
+    lo_y, hi_y = min(ay, by) - 1, max(ay, by) + 1
+    for (cx, cy) in z.cells:
+        if cx < lo_x or cx > hi_x or cy < lo_y or cy > hi_y or (cx, cy) in ignore_cells:
+            continue
+        if segment_hits_cell(ax, ay, bx, by, cx, cy):
+            return True
+    return False
+
+
 _IMPLS: dict = {}
 
 
@@ -79,12 +117,34 @@ def _impl(kind: str):
     return i
 
 
+GAS_KINDS = frozenset({"fog_cloud", "stinking_cloud", "cloudkill", "gas"})
+
+
+def _gas_filter(world, cells, center):
+    """Gas and fog do not spread through ``blocks_gas`` barriers (Wind Wall): drop cells whose line to the centre
+    crosses one."""
+    walls = [z for z in world.zones if z.params.get("blocks_gas")]
+    if not walls:
+        return cells
+    cx, cy = float(center[0]) + 0.5, float(center[1]) + 0.5
+    out = []
+    for (x, y) in cells:
+        if any(w.cellset and (x, y) not in w.cellset and (int(center[0]), int(center[1])) not in w.cellset and
+               any(segment_hits_cell(cx, cy, x + 0.5, y + 0.5, wx, wy) for (wx, wy) in w.cells)
+               for w in walls):
+            continue
+        out.append((x, y))
+    return out or cells[:1]
+
+
 def create_zone(world, source, kind: str, cells, center, radius: float, duration: int, params: dict | None = None,
                 harmful: bool = True, attached_to: int = -1, link: int = 0, area=None, slot: int = 1,
                 dc: int = 10) -> Zone:
     """Create and register a zone; emits ZONE_START and runs enter triggers for creatures inside."""
     src = source.eid if source is not None and not isinstance(source, int) else (source if source is not None else -1)
     cells = [(int(x), int(y)) for x, y in cells]
+    if world.zones and (kind in GAS_KINDS or (params or {}).get("gas")):
+        cells = _gas_filter(world, cells, center)
     z = Zone(world.new_uid(), kind, cells, (float(center[0]), float(center[1])), float(radius), src, duration,
              dict(params) if params else {}, attached_to, harmful, link, area)
     z.slot = slot

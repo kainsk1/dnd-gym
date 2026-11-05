@@ -115,6 +115,9 @@ class CoreSnapshot:
                  "seed_rng", "explore_gain")
 
 
+_UNSET = object()
+
+
 class EmberdeepCore:
     """One Emberdeep episode stream: build, step, observe, reward."""
 
@@ -545,9 +548,13 @@ class EmberdeepCore:
     def action_mask(self, agent: str) -> np.ndarray:
         return self.context(agent).action_mask
 
-    def info_for(self, agent: str, outcome: StepOutcome | None = None) -> dict:
-        """The ``infos[agent]`` dict (see docs/ENV_API.md)."""
-        info: dict = {"acting": self.decider_agent() == agent}
+    def info_for(self, agent: str, outcome: StepOutcome | None = None, decider=_UNSET, comp: bool = True) -> dict:
+        """The ``infos[agent]`` dict (see docs/ENV_API.md).  ``decider`` (the current ``decider_agent()``) may be passed
+        by callers that build several infos per step; ``comp=False`` leaves ``reward_components`` as a ``None``
+        placeholder for the caller to fill (the AEC wrapper accumulates its own)."""
+        if decider is _UNSET:
+            decider = self.decider_agent()
+        info: dict = {"acting": decider == agent}
         dec = self.world.pending_decision
         if dec is not None and dec.eid == self.agent_eid[agent]:
             info["decision"] = {"kind": DecisionKind(int(dec.kind)).name.lower(),
@@ -557,13 +564,16 @@ class EmberdeepCore:
             info["decision"] = None
         if outcome is not None:
             i = self.agent_index[agent]
-            row = outcome.components[i]
-            comp = {COMPONENTS[j]: float(row[j]) for j in np.nonzero(row)[0].tolist()}
-            for k, v in outcome.extra.get(agent, {}).items():
-                comp[k] = v
-            info["reward_components"] = comp
+            if comp:
+                row = outcome.components[i]
+                rc = {COMPONENTS[j]: float(row[j]) for j in np.nonzero(row)[0].tolist()}
+                for k, v in outcome.extra.get(agent, {}).items():
+                    rc[k] = v
+                info["reward_components"] = rc
+            else:
+                info["reward_components"] = None
             info["reward_raw"] = float(outcome.raw[i])
-            if outcome.illegal and outcome.acted is None and agent == self.decider_agent():
+            if outcome.illegal and outcome.acted is None and agent == decider:
                 info["invalid_action"] = True
             if self.cfg.events_in_info:
                 info["events"] = [e.to_dict() for e in outcome.events]

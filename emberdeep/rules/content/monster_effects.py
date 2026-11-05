@@ -147,16 +147,23 @@ def restore_max_hp(world, c) -> None:
 
 @register_effect("mummy_rot")
 class MummyRot(MEffect):
-    """Curse: can't regain HP; HP maximum reduced by the necrotic damage dealt (the 24-hour tick is compressed into the hit)."""
+    """Curse of mummy rot: the bearer can't regain hit points, and its hit point maximum decreases by 3d6 for every 24
+    hours that elapse (each long rest stands for 24 hours); at 0 maximum the body turns to dust.  The curse lasts until
+    Remove Curse.  The hit itself reduces nothing."""
     BLOCKS_HEALING = True
+    HOOKS = frozenset({"on_long_rest"})
 
-    def on_apply(self, world):
-        c = world.entities[self.me]
-        if c.status & S.DEAD:
+    def on_long_rest(self, world, me):
+        if me.status & S.DEAD:
             return
-        n = recent_damage(world, self.source, self.me, DamageType.NECROTIC)
-        if n > 0:
-            reduce_max_hp(world, c, n)
+        n = D.roll(world.rng, str(self.params.get("dice", "3d6")))
+        me.max_hp -= n
+        me.hp = min(me.hp, me.max_hp)
+        me.touch()
+        U.log(world, f"{me.name}'s hit point maximum is reduced by {n} (mummy rot)", me.eid)
+        if me.max_hp <= 0:
+            me.max_hp = 0
+            R.die(world, me, self.source, "mummy_rot")
 
 
 @register_effect("wasting_disease")
@@ -213,7 +220,9 @@ class SleepPoison(MEffect):
         c = world.entities[self.me]
         if c.status & S.DEAD:
             return
-        R.add_condition(world, c, Condition.POISONED, self.source, -1, link=self.uid)
+        # the attack data already poisons the target on a failed save: don't stack a second POISONED from the same source
+        if not any(ci.source == self.source for ci in c.conditions.get(int(Condition.POISONED), ())):
+            R.add_condition(world, c, Condition.POISONED, self.source, -1, link=self.uid)
         if fail_margin(world, self.me) >= int(self.params.get("unconscious_if_fail_by", 5)):
             R.add_condition(world, c, Condition.UNCONSCIOUS, self.source, -1,
                             ends_on_damage=bool(self.params.get("wakes_on_damage", True)), link=self.uid)

@@ -16,6 +16,8 @@ class Ribbon:
         self.size: dict[int, float] = {}
         self.rect = pygame.Rect(0, 0, 0, 0)
         self.surprised: set[int] = set()
+        self.moving = False
+        self.active_ring: tuple | None = None
 
     def on_event(self, d: dict) -> None:
         from emberdeep.core.events import EventType as ET
@@ -27,6 +29,16 @@ class Ribbon:
             self.surprised.discard(d.get("src", -1))
         elif t in (ET.COMBAT_END, ET.EPISODE_START):
             self.surprised.clear()
+
+    def draw_overlay(self, surf) -> None:
+        if self.active_ring is None:
+            return
+        ui = self.hud.ui
+        c, isize = self.active_ring
+        pulse = 0.5 + 0.5 * math.sin(self.hud.t * 3.2)
+        g = pygame.Surface((isize + ui.s(24), isize + ui.s(24)), pygame.SRCALPHA)
+        pygame.draw.circle(g, (*T.GOLD_HI, int(40 + 50 * pulse)), g.get_rect().center, isize // 2 + ui.s(5), ui.s(2))
+        surf.blit(g, g.get_rect(center=c))
 
     def _hidden(self, e, view) -> bool:
         hud = self.hud
@@ -42,6 +54,7 @@ class Ribbon:
         if fr is None:
             return
         dt = hud.dt
+        self.active_ring = None
         if fr.mode != "combat":
             self._draw_explore(surf, avail, view)
             return
@@ -111,6 +124,8 @@ class Ribbon:
         pygame.draw.line(surf, (*T.GOLD_DIM,), (sepx, panel.y + pad), (sepx, panel.bottom - pad), 1)
         x0 = sepx + ui.s(18)                      # reserve room for the glow ring
         prev_right = -1e9
+        moving = False
+        self.active_ring = None
         for e, sz, cx_rel in slots:
             tx = x0 + cx_rel
             cx = self.x.get(e.id, tx)
@@ -121,6 +136,7 @@ class Ribbon:
             cs = T.smooth_to(self.size.get(e.id, sz), sz, hud.dt, 12.0)
             self.size[e.id] = cs
             cx = max(cx, x0 + cs / 2)                          # never over the round plate
+            moving = moving or abs(cx - tx) > 0.6
             self.x[e.id] = cx
             prev_right = cx + cs / 2
             isize = int(round(cs))
@@ -134,10 +150,7 @@ class Ribbon:
             r = med.get_rect(center=(int(cx), my))
             surf.blit(med, r)
             if active:
-                pulse = 0.5 + 0.5 * math.sin(hud.t * 3.2)
-                g = pygame.Surface((isize + ui.s(24), isize + ui.s(24)), pygame.SRCALPHA)
-                pygame.draw.circle(g, (*T.GOLD_HI, int(40 + 50 * pulse)), g.get_rect().center, isize // 2 + ui.s(5), ui.s(2))
-                surf.blit(g, g.get_rect(center=r.center))
+                self.active_ring = (r.center, isize)
                 tri = [(int(cx) - ui.s(6), r.top - ui.s(2)), (int(cx) + ui.s(6), r.top - ui.s(2)), (int(cx), r.top + ui.s(4))]
                 pygame.draw.polygon(surf, T.GOLD_HI, tri)
                 nm = ui.text(ui.ellipsize(e.name, "title", 12.5, ui.s(150)), "title", 12.5, T.TEXT, shadow=True)
@@ -170,6 +183,7 @@ class Ribbon:
             ui.blit_text(surf, str(len(dead)), (tr.x + ui.s(24), tr.centery), "mono", 12, T.TEXT_DIM, anchor="midleft")
             hud.hot(tr, tip=lambda: __import__("emberdeep.render.ui.widgets", fromlist=["Tip"]).Tip(
                 "Fallen", lines=[(", ".join(e.name for e in dead[:12]), T.TEXT_DIM)], icon="skull-crossed-bones"))
+        self.moving = moving
         live = {e.id for e, _, _ in slots}
         for k2 in list(self.x):
             if k2 not in live:

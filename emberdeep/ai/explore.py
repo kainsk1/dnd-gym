@@ -174,7 +174,7 @@ def interact_with(sc: Scene, e) -> Act | None:
         if mask[k] and abil[k].valid_target(w, c, e.eid):
             return Act(ActKind.ABILITY, k, e.eid)
         k = U["force_open"]
-        if mask[k] and abil[k].valid_target(w, c, e.eid) and c.mods[0] >= 1:
+        if mask[k] and abil[k].valid_target(w, c, e.eid):
             return Act(ActKind.ABILITY, k, e.eid)
     return None
 
@@ -226,6 +226,8 @@ def door_toward(sc: Scene, tx: int, ty: int) -> Act | None:
     Closed unlocked doors are opened with ``interact``; locked ones with the key, thieves' tools or brute force
     (``interact_with``).  Doors that cannot be opened are skipped; returns None if nothing can be done."""
     c, w = sc.c, sc.w
+    if not w.map.door_closed.any():
+        return None
     cost_ap, _ = cost_grids(sc)
     dist = geo.dijkstra(cost_ap, c.x, c.y, 1e6, _rule(w))
     best = None
@@ -256,4 +258,4 @@ def _can_open_locked(sc: Scene, o) -> bool:
     c = sc.c
     if o.key_id and c.find_item(o.key_id):
         return True
-    return c.find_item("thieves_tools") is not None or c.mods[0] >= 2
+    return True                      # force_open is always worth a try (Athletics)

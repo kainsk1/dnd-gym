@@ -9,7 +9,7 @@ import numpy as np
 
 from emberdeep.core import _geom_fallback as GF
 from emberdeep.core.types import (
-    BLOCKS_MOVE, BLOCKS_SIGHT, DIFFICULT_TERRAIN, LightLevel, Terrain,
+    BLOCKS_MOVE, BLOCKS_SIGHT, DIFFICULT_TERRAIN, LightLevel, Material, Terrain,
 )
 
 _AMBIENT = {"dark": LightLevel.DARK, "dim": LightLevel.DIM, "bright": LightLevel.BRIGHT}
@@ -24,9 +24,23 @@ class StaticMap:
         self.terrain = np.asarray(md.terrain, dtype=np.uint8)
         self.material = np.asarray(md.material, dtype=np.uint8)
         t = self.terrain
-        self.blocks_move = np.isin(t, [int(x) for x in BLOCKS_MOVE])
+        # v1.1: low walls / crates are climbable obstacles (10 ft per square without a climb speed, 5 ft with one);
+        # they keep providing half cover but no longer block movement.
+        self.climbable = t == int(Terrain.LOW_WALL)
+        self.blocks_move = np.isin(t, [int(x) for x in BLOCKS_MOVE if x != Terrain.LOW_WALL])
         self.blocks_sight = np.isin(t, [int(x) for x in BLOCKS_SIGHT])
-        self.difficult = np.isin(t, [int(x) for x in DIFFICULT_TERRAIN])
+        self.difficult = np.isin(t, [int(x) for x in DIFFICULT_TERRAIN]) | self.climbable
+        # burrowing (SRD: sand, earth, mud, ice - not solid rock): diggable squares and solid rock
+        mat = self.material
+        self.diggable = (np.isin(mat, [int(Material.CAVE_FLOOR), int(Material.DIRT), int(Material.GRASS),
+                                       int(Material.SAND), int(Material.RUBBLE), int(Material.MOSS),
+                                       int(Material.SNOW), int(Material.ICE)])
+                         | np.isin(t, [int(Terrain.DIFFICULT), int(Terrain.BRUSH), int(Terrain.ICE)]))
+        self.diggable &= ~np.isin(t, [int(Terrain.WALL), int(Terrain.VOID), int(Terrain.PIT), int(Terrain.LAVA),
+                                      int(Terrain.WATER_DEEP), int(Terrain.WATER_SHALLOW)])
+        self.solid_rock = np.isin(t, [int(Terrain.WALL), int(Terrain.PILLAR), int(Terrain.STATUE)])
+        self.no_burrow = np.isin(t, [int(Terrain.VOID), int(Terrain.PIT), int(Terrain.LAVA), int(Terrain.WATER_DEEP),
+                                     int(Terrain.WATER_SHALLOW)])
         self.half_cover = t == int(Terrain.LOW_WALL)
         self.tq_cover = t == int(Terrain.STATUE)
         self.lava = t == int(Terrain.LAVA)
@@ -34,6 +48,7 @@ class StaticMap:
         self.deep = t == int(Terrain.WATER_DEEP)
         self.shallow = t == int(Terrain.WATER_SHALLOW)
         self.water = self.deep | self.shallow
+        self.has_deep = bool(self.deep.any())
         self.exit = t == int(Terrain.EXIT)
         self.ice = t == int(Terrain.ICE)
         self.light_obscure = t == int(Terrain.BRUSH)
@@ -177,7 +192,7 @@ class GameMap:
     # ------------------------------------------------------------------ occupancy
     def place(self, c) -> None:
         """Mark a creature's squares in the occupancy grid."""
-        if c.z > 0:
+        if c.z != 0:                       # airborne (z > 0) or burrowed (z < 0): not on the ground grid
             self.air[c.eid] = c.z
             return
         s = c.size_sq
@@ -185,7 +200,7 @@ class GameMap:
 
     def place_shared(self, c) -> None:
         """Place ``c`` without evicting other occupants: occupied squares record it as a secondary occupant."""
-        if c.z > 0:
+        if c.z != 0:
             self.air[c.eid] = c.z
             return
         s = c.size_sq
@@ -200,7 +215,7 @@ class GameMap:
                         lst.append(c.eid)
 
     def unplace(self, c) -> None:
-        if c.z > 0:
+        if c.z != 0:
             self.air.pop(c.eid, None)
             return
         s = c.size_sq
@@ -258,22 +273,38 @@ class GameMap:
                 cost[infl] = np.inf
             self._cost_cache[ck] = cost
             return cost
-        if mode == "fly":
-            blocked = st.blocks_sight | self.door_closed
+        if mode == "burrow":                       # tunnelling beneath the surface (cost scaled by the caller)
+            blocked = ~st.diggable | self.door_closed | self.sealed
+            cost = np.where(blocked, np.inf, 1.0).astype(np.float32)
+        elif mode == "burrow_rock":                # earth glide: through stone as well
+            blocked = st.no_burrow | self.door_closed | self.sealed
+            cost = np.where(blocked, np.inf, 1.0).astype(np.float32)
+        elif mode == "fly":
+            blocked = st.blocks_sight | self.door_closed | self.sealed
             cost = np.where(blocked, np.inf, 1.0).astype(np.float32)
             cost[self.zone_diff & ~blocked] = 2.0
         else:
             blocked = self.blocked
             cost = np.ones((self.H, self.W), dtype=np.float32)
-            diff = st.difficult | self.zone_diff
-            if mode == "swim":
-                diff = (diff & ~st.water) | self.zone_diff
+            base = st.difficult
+            if "swim" in mode:
+                base = base & ~st.water
+            if "climb" in mode:
+                base = base & ~st.climbable
+            diff = base | self.zone_diff
             cost[diff] = 2.0
             cost[st.lava] = 60.0
             cost[blocked] = np.inf
         if size > 1:
             infl = GF.geo.inflate_blocked(~np.isfinite(cost), size)
+            base = cost
             cost = cost.copy()
+            H, W = cost.shape
+            for dy in range(size):                   # a big creature pays for the worst square of its footprint
+                for dx in range(size):
+                    if dx or dy:
+                        sub = np.where(np.isfinite(base[dy:, dx:]), base[dy:, dx:], 0.0)
+                        cost[:H - dy, :W - dx] = np.maximum(cost[:H - dy, :W - dx], sub)
             cost[infl] = np.inf
         self._cost_cache[ck] = cost
         return cost

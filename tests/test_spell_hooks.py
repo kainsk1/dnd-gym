@@ -247,7 +247,8 @@ def test_minor_illusion_blocks_sight_until_walked_into():
     gm.x, gm.y = 7, 5
     w.map.place(gm)
     Z.trigger_enter(w, gm, [(8, 5)])
-    assert z not in w.zones and not w.map.zone_opaque[5, 7]
+    assert z in w.zones and w.map.zone_opaque[5, 7]            # v1.1: only the creature that walked in sees through it
+    assert w.ext["illusion_seen"][z.zid] == (g,)
 
 
 def test_minor_illusion_investigation_at_round_start():
@@ -260,7 +261,8 @@ def test_minor_illusion_investigation_at_round_start():
     for e in w.entities[c].effects:
         if e.ID == "minor_illusion_link":
             e.on_round_start(w, w.entities[c])
-    assert not [z for z in w.zones if z.kind == "minor_illusion"]
+    z = next(z for z in w.zones if z.kind == "minor_illusion")
+    assert w.ext["illusion_seen"][z.zid] == (g,)               # per observer; the image stays for everyone else
 
 
 def test_produce_flame_light_throw_scales_and_ends():

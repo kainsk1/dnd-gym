@@ -149,7 +149,7 @@ def test_special_vfx_keys_are_renderer_keys():
 
 
 MARKERS = ["amphibious", "water_breathing", "hold_breath", "limited_amphibiousness", "beast_of_burden", "amorphous",
-           "siege_monster", "web_sense", "ooze_cube", "aggressive",
+           "siege_monster", "web_sense", "aggressive",
            "cunning_action", "divine_eminence", "brute", "wakeful", "hellish_rejuvenation", "labyrinthine_recall",
            "shark_telepathy", "speak_with_beasts_and_plants", "limited_telepathy", "telepathic_bond", "mimicry",
            "tree_stride", "innate_spellcasting", "ethereal_sight", "ephemeral", "iron_scent", "running_leap",
@@ -704,7 +704,8 @@ def test_transparent_cube_needs_dc_15_to_notice():
     assert hook_of(cube, "transparent").can_hide(b.w, cube, f)
 
 
-def test_shapechanger_werewolf_forms_speeds_and_free_form_switch_on_attack():
+def test_shapechanger_werewolf_forms_speeds_and_form_restricted_attacks():
+    """v1.1: form-restricted attacks are blocked in the other forms (ability_blocked); changing form costs the action."""
     b = Box()
     ww = b.mon("werewolf", 5, 5)
     tgt = b.dummy(6, 5)
@@ -712,25 +713,43 @@ def test_shapechanger_werewolf_forms_speeds_and_free_form_switch_on_attack():
     ids = [a.id for a in b.w.abilities(ww.eid)]
     assert {"shapechange_wolf", "shapechange_hybrid"} <= set(ids)
     assert "shapechange_humanoid" not in ids                                   # already humanoid
+
+    def usable(aid):
+        i, _ = b.ability(ww, aid)
+        return bool(b.w.ability_mask(ww.eid)[i])
+    b.act(ww)
+    assert usable("spear") and not usable("claws") and not usable("bite")      # humanoid: spear only
     b.use(ww, "shapechange_wolf")
     assert U.mh(ww)["form"] == "wolf" and ww.speeds["walk"] == 40
+    assert ww.ts.action_used                                                    # the change cost the action
     assert R.compute_ac(b.w, ww) == 12
     ids = [a.id for a in b.w.abilities(ww.eid)]
     assert "shapechange_humanoid" in ids and "shapechange_hybrid" in ids and "shapechange_wolf" not in ids
     b.act(ww)
+    assert usable("bite") and not usable("claws") and not usable("spear")      # wolf: bite only
+    b.use(ww, "shapechange_hybrid")
+    b.act(ww)
+    assert usable("bite") and usable("claws") and not usable("spear")          # hybrid: bite + claws
     b.use(ww, "shapechange_humanoid")
     assert U.mh(ww)["form"] == "humanoid" and ww.speeds["walk"] == 30
-    # the claws are hybrid-only: using them switches the form for free
     b.act(ww)
-    _dmg_total(b, ww, "claws", tgt)
-    assert U.mh(ww)["form"] == "hybrid"
-    # bite is wolf-or-hybrid: no switch from hybrid
+    assert usable("spear") and not usable("claws")
+
+
+def test_scripted_lycanthrope_shifts_into_hybrid_form_with_its_first_combat_action():
+    b = Box()
+    ww = b.mon("werewolf", 5, 5)
+    b.dummy(8, 5)
+    b.go()
     b.act(ww)
-    _dmg_total(b, ww, "bite", tgt)
-    assert U.mh(ww)["form"] == "hybrid"
+    h = hook_of(ww, "shapechanger")
+    from emberdeep.core.types import GameMode
+    b.w.mode = int(GameMode.COMBAT)
+    h.on_turn_start(b.w, ww)
+    assert U.mh(ww)["form"] == "hybrid" and ww.ts.action_used
     b.act(ww)
-    _dmg_total(b, ww, "spear", tgt)
-    assert U.mh(ww)["form"] == "humanoid"
+    h.on_turn_start(b.w, ww)                                                    # already in the fighting form
+    assert not ww.ts.action_used
 
 
 def test_shapechanger_imp_quasit_doppelganger_mimic():
@@ -1428,7 +1447,7 @@ def test_engulf_gelatinous_cube():
     b = Box()
     cube = b.mon("gelatinous_cube", 6, 6)
     f1 = b.pc(5, 6, hp=300)
-    f2 = b.pc(8, 6, hp=300)                                            # 1 square from the Large cube (6-7)
+    f2 = b.pc(6, 8, hp=300)                                            # just below the Large cube (6-7 x 6-7)
     far = b.pc(15, 15)
     b.go()
     b.w.rng = mean_rng()
@@ -1440,7 +1459,10 @@ def test_engulf_gelatinous_cube():
     assert f1.has(C.RESTRAINED) and f1.has(C.GRAPPLED) and EF.has_effect(f1, "engulfed")
     assert hp - f1.hp == 3 * 4                                           # 3d6 acid
     assert f1.eid in cube.grappling
-    assert not f2.has(C.RESTRAINED) and f2.x == 9                         # pushed back 5 ft
+    # v1.1: the cube moves (up to its speed) and enters the creatures' spaces; f2 saved and was pushed out of the cube
+    saves = [e for e in b.w.events if e.t == ET.SAVE and e.data.get("source") == "engulf"]
+    assert [e.dst for e in saves] == [f1.eid, f2.eid]
+    assert not f2.has(C.RESTRAINED) and not (set(cube.cells()) & set(f2.cells()))
     # damage at the start of every round while engulfed
     hp = f1.hp
     e = [e for e in f1.effects if e.ID == "engulfed"][0]
@@ -1448,7 +1470,7 @@ def test_engulf_gelatinous_cube():
     assert hp - f1.hp == 6 * 4
     # the cube drags the victim along when it moves
     b.act(cube)
-    assert b.w.try_step(cube, 0, 1)
+    assert b.w.try_step(cube, 0, -1)
     assert b.w.distance(cube.eid, f1.eid) <= 1
     # escaping (STR check vs the escape DC) frees the creature and ends the effect
     R.remove_condition(b.w, f1, C.GRAPPLED)
@@ -1894,18 +1916,40 @@ def test_vampire_spawn_bite_drains_necrotic_amount_and_heals_the_vampire():
     assert v.hp == 40 + necrotic
 
 
-def test_mummy_rot_blocks_healing_and_cuts_max_hp():
+def test_mummy_rot_is_a_curse_blocking_healing_with_a_3d6_max_hp_tick_per_24_hours():
     b = Box()
     m = b.mon("mummy", 6, 5)
     t = b.dummy(5, 5, mid="bandit")
     t.hp = t.max_hp = 100
     b.go()
     _force_fail(t, A.CON)
-    ev = _hit(b, m, "rotting_fist", t)
-    necrotic = sum(e.amount for e in ev if e.t == ET.DAMAGE and e.kind == int(DT.NECROTIC))
-    assert EF.has_effect(t, "mummy_rot") and t.max_hp == 100 - necrotic
+    _hit(b, m, "rotting_fist", t)
+    assert EF.has_effect(t, "mummy_rot") and t.max_hp == 100             # nothing is lost at the hit
     hp = t.hp
-    assert R.heal(b.w, None, t, 20, "cure") == 0 and t.hp == hp
+    assert R.heal(b.w, None, t, 20, "cure") == 0 and t.hp == hp           # can't regain hit points
+    b.w.rng = mean_rng()
+    b.w.long_rest([t])                                                    # 24 hours: max HP -3d6 (all dice 4 = 12)
+    assert t.max_hp == 100 - 12 and t.hp == t.max_hp
+    b.w.long_rest([t])
+    assert t.max_hp == 100 - 24
+    R.heal(b.w, None, t, 5, "cure")                                       # still no healing (long rest restored hp to max)
+    # Remove Curse lifts it
+    from emberdeep.rules.content import spell_hooks_l3  # noqa: F401
+    EF.remove_by_id(b.w, t, "mummy_rot")
+    t.hp = 10
+    assert R.heal(b.w, None, t, 5, "cure") == 5
+
+
+def test_sleep_poison_does_not_stack_a_second_poisoned_condition():
+    b = Box()
+    drow = b.mon("drow", 6, 5)
+    t = b.dummy(5, 5, mid="bandit")
+    t.hp = t.max_hp = 100
+    b.go()
+    _force_fail(t, A.CON)
+    _hit(b, drow, "hand_crossbow", t)
+    assert t.has(C.POISONED)
+    assert len(t.conditions[int(C.POISONED)]) == 1
 
 
 def test_wasting_disease_each_long_rest_costs_max_hp_on_a_failed_save():

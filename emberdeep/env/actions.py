@@ -22,6 +22,7 @@ import numpy as np
 from emberdeep.core.actions import Act, ActKind
 from emberdeep.core.entities import S
 from emberdeep.core.types import DIR_VECTORS, EntityKind
+from emberdeep.core import fastkernels as FK
 from emberdeep.env import kernels as K
 
 log = logging.getLogger(__name__)
@@ -71,41 +72,62 @@ def point_slots(world, c, rings: tuple, cache: dict) -> tuple[np.ndarray, np.nda
 
     ``cache`` (owned by the env core) memoises the result per creature position and map-opacity version."""
     P = 8 * len(rings)
-    pts = np.empty((P, 2), np.int32)
-    ok = np.zeros(P, bool)
     if P == 0:
-        return pts, ok
+        return np.empty((0, 2), np.int32), np.zeros(0, bool)
     m = world.map
     key = (c.x, c.y, m.opaque_version, rings)
     hit = cache.get(c.eid)
     if hit is not None and hit[0] == key:
         return hit[1], hit[2]
+    pts = np.empty((P, 2), np.int32)
+    ok = np.zeros(P, bool)
+    if K.REF:
+        point_slots_ref_into(m, c, rings, pts, ok)
+    else:
+        FK.point_slots_into(m.opaque, c.x, c.y, _rings_arr(rings), _DIRS, pts, ok)
+    cache[c.eid] = (key, pts, ok)
+    return pts, ok
+
+
+def point_slots_ref_into(m, c, rings, pts, ok) -> None:
+    """Reference (pure Python) fill of ``pts`` / ``ok`` for :func:`point_slots`."""
     opaque = m.opaque
     H, W = m.H, m.W
     maxr = rings[-1]
     for d in range(8):
         dx, dy = DIR_VECTORS[d]
-        cx, cy, steps = c.x, c.y, 0
+        steps = 0
         reach = []
         for s in range(1, maxr + 1):
             nx, ny = c.x + dx * s, c.y + dy * s
             if nx < 0 or ny < 0 or nx >= W or ny >= H or opaque[ny, nx]:
                 break
-            cx, cy, steps = nx, ny, s
+            steps = s
             reach.append((nx, ny))
         for i, r in enumerate(rings):
             j = i * 8 + d
             if steps == 0:
                 pts[j] = (c.x, c.y)
+                ok[j] = False
             else:
                 pts[j] = reach[min(r, steps) - 1]
                 ok[j] = True
-    cache[c.eid] = (key, pts, ok)
-    return pts, ok
+
+
+_RINGS: dict = {}
+_DIRS = np.array(DIR_VECTORS, np.int64)
+
+
+def _rings_arr(rings: tuple) -> np.ndarray:
+    a = _RINGS.get(rings)
+    if a is None:
+        a = _RINGS[rings] = np.array(rings, np.int64)
+    return a
 
 
 _SPECIAL_SENSES = ("devils_sight", "tremorsense", "blindsight", "truesight")
 _HIDDEN = int(S.HIDDEN)
+_DEAD = int(S.DEAD)
 _INVIS_BIT = 6
 
 
@@ -119,11 +141,13 @@ def sees_batch(world, c, frame, rows: np.ndarray) -> np.ndarray:
     out = np.empty(rows.shape[0], bool)
     s = c.senses
     m = world.map
+    op = world._observer_opaque(c) if world.ext else m.opaque          # discerned illusions do not block this observer
     if (c.size_sq == 1 and c.present and c.kind == 0 and not c.status & S.DEAD and not c.cond_mask & 1
             and world.rules.diagonal_rule == "chebyshev" and not m.zone_heavy[c.y, c.x]
-            and not (s and any(s.get(k, 0) for k in _SPECIAL_SENSES))):
+            and not (s and any(s.get(k, 0) for k in _SPECIAL_SENSES)) and not op[c.y, c.x]
+            and not FK.any_in_opaque(op, frame.x, frame.y, frame.present)):      # incorporeal creatures inside walls: ask World.sees
         res = np.empty(rows.shape[0], np.int8)
-        K.sees_rows(m.opaque, world.light_grid(), m.zone_heavy, m.zone_dark, c.x, c.y, c.z, world.rules.sight_radius,
+        K.sees_rows(op, world.light_grid(), m.zone_heavy, m.zone_dark, c.x, c.y, c.z, world.rules.sight_radius,
                     s.get("darkvision", 0) if s else 0, bool(s.get("see_invisible", 0)) if s else False, rows,
                     frame.x, frame.y, frame.z, frame.size, frame.kind, frame.cond, frame.status, frame.present, _HIDDEN,
                     _INVIS_BIT, res)
@@ -142,6 +166,51 @@ def sees_batch(world, c, frame, rows: np.ndarray) -> np.ndarray:
 
 
 def select_slots(core, frame, agent: str):
+    """Choose the entity slots of ``agent``: ``(slot_eids [E], slot_rows [E], visible bool [n])``.
+
+    Slot 0 is the agent's own creature.  The remaining slots hold visible creatures (and objects, capped to a
+    quarter of the slots while enough creatures exist), nearest first (``entity_order='distance'``) or ordered by
+    entity id (``'fixed'``).  Allies are always listed when ``allies_always_visible``.
+
+    Numba fast path for the common case (no vision sharing, a size-1 observer without exotic senses); everything
+    else, and ``EMBERDEEP_OBS_REF=1``, goes through :func:`select_slots_ref` (bit-identical results)."""
+    cfg = core.cfg
+    world = core.world
+    eid = core.agent_eid[agent]
+    r0 = frame.row(eid)
+    c = world.entities[eid]
+    m = world.map
+    s = c.senses
+    if (K.REF or cfg.vision_sharing != "none" or r0 < 0 or frame.n <= 1 or c.size_sq != 1 or not c.present
+            or c.status & _DEAD or c.cond_mask & 1 or world.rules.diagonal_rule != "chebyshev" or not _PREFILTER
+            or m.zone_heavy[c.y, c.x] or (world.ext and world._observer_opaque(c) is not m.opaque)
+            or m.opaque[c.y, c.x] or FK.any_in_opaque(m.opaque, frame.x, frame.y, frame.present)):
+        return select_slots_ref(core, frame, agent)
+    dv = 0
+    see_inv = False
+    if s:
+        if s.get("tremorsense", 0) or s.get("devils_sight", 0) or s.get("blindsight", 0) or s.get("truesight", 0):
+            return select_slots_ref(core, frame, agent)
+        dv = s.get("darkvision", 0)
+        see_inv = bool(s.get("see_invisible", 0))
+    tab = frame.tab
+    slot_eids, slot_rows, visible, res, dist, ev_keys, ev_vals, n_ev, n_fb = K.select_all(
+        tab, r0, world.rules.sight_radius, core.visible_for(agent), m.opaque, world.light_grid(), m.zone_heavy,
+        m.zone_dark, dv, see_inv, _HIDDEN, _INVIS_BIT, eid << 12, c.faction, bool(cfg.allies_always_visible),
+        cfg.max_entities, cfg.entity_order == "distance")
+    if n_ev:
+        world._sees_cache.update(zip(ev_keys[:n_ev].tolist(), map(bool, ev_vals[:n_ev].tolist())))
+    if n_fb:
+        sees = world.sees
+        eids = tab[:, K.F_EID]
+        for r in np.flatnonzero(res < 0).tolist():
+            res[r] = 1 if sees(eid, int(eids[r])) else 0
+        return K.select_order(tab, res, dist, r0, c.faction, bool(cfg.allies_always_visible), cfg.max_entities,
+                              cfg.entity_order == "distance")
+    return slot_eids, slot_rows, visible
+
+
+def select_slots_ref(core, frame, agent: str):
     """Choose the entity slots of ``agent``: ``(slot_eids [E], slot_rows [E], visible bool [n])``.
 
     Slot 0 is the agent's own creature.  The remaining slots hold visible creatures (and objects, capped to a
@@ -176,7 +245,8 @@ def select_slots(core, frame, agent: str):
         if eid not in watchers:
             watchers.append(eid)
     if (_PREFILTER and cfg.vision_sharing == "none" and not c.senses.get("tremorsense", 0) and cand.size
-            and c.present and not c.status & S.DEAD):
+            and c.present and not c.status & S.DEAD
+            and not (world.ext and world._observer_opaque(c) is not world.map.opaque)):
         # a creature whose squares are all outside the observer's visible cells cannot be seen (cheap necessary
         # condition; objects are excluded because their sight rule ignores light)
         vg = core.visible_for(agent)
@@ -251,8 +321,7 @@ def build_context(core, agent: str, frame) -> ActionContext:
     ctx = ActionContext()
     ctx.agent, ctx.eid, ctx.layout = agent, eid, lay
     ctx.slot_eids, ctx.slot_rows, ctx.visible_rows = select_slots(core, frame, agent)
-    ctx.n_slots = int((ctx.slot_eids >= 0).sum())
-    ctx.pts, ctx.pt_ok = point_slots(world, c, cfg.rings, core.pt_cache)
+    ctx.n_slots = int(np.count_nonzero(ctx.slot_eids >= 0))
     mask = np.zeros(lay.A, np.int8)
     amask = np.zeros(lay.K, np.int8)
     tmask = np.zeros((lay.K, lay.T), np.int8)
@@ -263,8 +332,12 @@ def build_context(core, agent: str, frame) -> ActionContext:
     decider = world.decider() if not world.done else -1
     ctx.is_decider = decider == eid and core.is_live(agent)
     if not ctx.is_decider:
+        # waiting agents only ever have NOOP: no point targets, nothing else to compute
+        ctx.pts = np.zeros((lay.P, 2), np.int32)
+        ctx.pt_ok = np.zeros(lay.P, bool)
         mask[0] = 1
         return ctx
+    ctx.pts, ctx.pt_ok = point_slots(world, c, cfg.rings, core.pt_cache)
     if dec is not None:
         ctx.decision = dec
         n = min(len(dec.options), lay.D)
@@ -287,26 +360,19 @@ def build_context(core, agent: str, frame) -> ActionContext:
         pts_arg = pts
     else:
         pts_arg = np.zeros((0, 2), np.int32)
-    for k in np.nonzero(am)[0].tolist():
-        if k >= lay.K:
-            break
-        ab = abil[k]
-        tt = int(ab.target)
-        if tt <= _T_SELF:
-            # NONE / SELF: only the agent's own slot (and, for area abilities, the point slots) can be chosen;
-            # identical to ``world.target_mask`` for these target types, without the per-candidate calls
-            tm = np.zeros(T, bool)
-            tm[0] = True
-            if tt == _T_NONE and ab.area is not None and len(pts):
-                tm[E:] = ptok
-        else:
-            tm = world.target_mask(eid, k, cand, pts_arg)
-            if len(pts):
-                tm[E:] &= ptok
-        if tm.any():
-            amask[k] = 1
-            tmask[k, :T] = tm[:T]
-            mask[11 + k * T:11 + (k + 1) * T] = tm[:T]
+    K_ = lay.K
+    ks = [k for k in np.nonzero(am)[0].tolist() if k < K_]
+    if ks:
+        tmany = world.target_mask_many(eid, ks, cand, pts_arg)          # [len(ks), E + P]
+        if len(pts):
+            tmany[:, E:] &= ptok
+        has = tmany.any(axis=1)
+        if has.any():
+            ksa = np.asarray(ks)[has]
+            rows = tmany[has][:, :T]
+            amask[ksa] = 1
+            tmask[ksa] = rows
+            mask[11:11 + K_ * T].reshape(K_, T)[ksa] = rows
     ap = approach_mask(world, eid, cand, core.approach_cache)
     ap[0] = False
     mask[lay.base_approach:lay.base_approach + E] = ap

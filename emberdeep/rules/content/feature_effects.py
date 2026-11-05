@@ -7,7 +7,7 @@ from __future__ import annotations
 from emberdeep.core import dice as D
 from emberdeep.core import effects as EF
 from emberdeep.core import resolution as R
-from emberdeep.core.entities import S
+from emberdeep.core.entities import INCAP_MASK, S
 from emberdeep.core.events import EventType as ET
 from emberdeep.core.types import (
     COVER_AC_BONUS, Ability, Condition, DamageType, Relation, WeaponProperty,
@@ -38,7 +38,14 @@ class Rage(Effect):
     creature or taken damage since its last turn, or when it falls unconscious.  A berserker's Frenzy marks
     ``state['frenzied']`` and the bearer gains a level of exhaustion when the rage ends."""
     HOOKS = frozenset({"damage_mods", "resist_mask", "save_mods", "check_mods", "on_turn_end", "on_damaged",
-                       "attack_mods", "on_condition"})
+                       "attack_mods", "on_condition", "ability_blocked"})
+
+    def ability_blocked(self, world, me, ab):
+        """A raging creature can't cast spells (or concentrate): spell abilities and spell items are blocked."""
+        if ab.kind == "spell":
+            return True
+        it = ab.data.get("item") if isinstance(getattr(ab, "data", None), dict) else None
+        return bool(it is not None and getattr(it.def_, "use_spell", None))
 
     def on_apply(self, world):
         c = world.entities[self.me]
@@ -113,12 +120,18 @@ class Reckless(Effect):
 @register_effect("bardic_inspiration_die")
 class BardicInspirationDie(Effect):
     """An inspiration die (``params['die']`` sides) held by a creature for 10 minutes.  Engine hook ``after_d20``: once
-    the d20 of one of the holder's attack rolls, saving throws or DC-based ability checks is known, the holder spends the
-    die when the result falls short by no more than the die can cover, rolls it and adds it to the total."""
-    HOOKS = frozenset({"after_d20"})
+    the d20 of one of the holder's attack rolls, saving throws or ability checks against a DC is known, the holder may
+    spend the die (a *decision*: ``DecisionKind.POST_ROLL`` for agents; scripted holders spend it whenever it can turn
+    the failure into a success), rolls it and adds it to the total, as the SRD allows before the outcome is announced.
+    Contested checks (no DC to compare with) never offer it."""
+    HOOKS = frozenset({"after_d20", "reaction_options"})
+    POST_ROLL = True            # engine pre-check: this creature may have to answer a POST_ROLL decision
 
     def _sides(self) -> int:
         return int(self.params.get("die", 6))
+
+    def reaction_options(self, world, me, kind, ctx):
+        return ()               # marker so the engine snapshots for agent holders
 
     def after_d20(self, world, ctx, roll, total):
         target = None
@@ -139,7 +152,12 @@ class BardicInspirationDie(Effect):
         need = target - total
         if need <= 0 or need > self._sides():
             return 0
+        from emberdeep.rules.content.class_common import post_roll_ask
         c = world.entities[self.me]
+        if not post_roll_ask(world, self.me, "bardic_inspiration_die", f"Inspiration die d{self._sides()} ({what})", True,
+                             {"what": what, "roll": roll, "total": total, "dc": target, "source": "bardic_inspiration",
+                              "roller": self.me}, {"sides": self._sides()}):
+            return 0
         die = D.roll(world.rng, f"1d{self._sides()}")
         world.emit(ET.ABILITY_USE, self.me, -1, die, -1, {"ability": "bardic_inspiration_die",
                                                           "name": "Inspiration die (" + what + ")",
@@ -181,14 +199,32 @@ class SacredWeapon(Effect):
 # ---------------------------------------------------------------------------------------- turned
 @register_effect("turned")
 class Turned(Effect):
-    """Turned by Turn Undead / Turn the Unholy: no reactions; ends when the creature takes damage.  The movement
-    restriction is the FRIGHTENED condition applied alongside (it cannot willingly move closer to the source)."""
+    """Turned by Turn Undead / Turn the Unholy: no reactions; ends when the creature takes damage.  At the start of each of
+    its turns it must use its movement and action to get away from the source (Dash); with nowhere to go it Dodges.  The
+    FRIGHTENED condition applied alongside keeps it from willingly moving closer."""
     NO_REACTIONS = True
-    HOOKS = frozenset({"on_damaged"})
+    HOOKS = frozenset({"on_damaged", "on_turn_start"})
+
+    def BEHAVIOR(self):  # noqa: N802
+        return {"flee_from": self.source}
 
     def on_damaged(self, world, me, amount, src):
         if amount > 0:
             world.defer(lambda w, c=me, e=self: EF.remove_effect(w, c, e, "damaged"))
+
+    def on_turn_start(self, world, me):
+        src = world.entities[self.source] if 0 <= self.source < len(world.entities) else None
+        if src is None or not src.present or me.cond_mask & INCAP_MASK:
+            return
+        from emberdeep.rules.content.spell_effects import Commanded
+        ts = me.ts
+        before = (me.x, me.y)
+        ts.movement_left += R.base_speed(world, me)                 # the Dash action
+        Commanded._flee(world, me, src)
+        ts.action_used = True
+        ts.movement_left = 0
+        if (me.x, me.y) == before:
+            me.status |= int(S.DODGING)                              # nowhere to run: Dodge
 
 
 # ---------------------------------------------------------------------------------------- open hand: no reactions
