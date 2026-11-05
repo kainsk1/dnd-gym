@@ -1,0 +1,101 @@
+"""SRD 5.1 dragons: wyrmlings, a young red dragon and an adult white dragon (legendary boss)."""
+from __future__ import annotations
+
+from emberdeep.core.types import ActionCost, TargetType
+from emberdeep.data.monsters_common import (
+    A, C, D, T, cond, cone, dm, eff, line, mel, mon, reg, sact, spec, sphere, sv,
+)
+
+DR = T.DRAGON
+_BR = "shared_recharge:breath"
+
+
+def _wyrmling(id_, name, cr, ac, hp_dice, abil, saves, skills, imm, speed, bite, breaths, tint, icon="dragon-head", desc=""):
+    return mon(id_, name, "medium", DR, cr, ac, hp_dice, abil, ac_desc="natural armor", speed=speed, saves=saves, skills=skills,
+               imm=imm, senses="blindsight 10, darkvision 60", lang="Draconic", align=desc[0], actions=(bite,) + tuple(breaths),
+               ai="boss", morale=0.1, surrender=False, gold="4d6", icon=icon, tint=tint, tags=("dragon", "wyrmling", id_.split("_")[0]),
+               desc=desc[1])
+
+
+MONSTERS = reg(
+    _wyrmling("red_dragon_wyrmling", "Red Dragon Wyrmling", "4", 17, "10d8+30", (19, 10, 17, 12, 11, 15), "dex 2, con 5, wis 2, cha 4",
+              "perception 4, stealth 2", "fire", "30, climb 30, fly 60",
+              mel("bite", "Bite", 6, "1d10+4 p; 1d6 fire"),
+              (sact("fire_breath", "Fire Breath", sv(A.DEX, 13, half=True), cone(15), "7d6 fire", recharge=5, vfx="breath_fire"),),
+              (200, 50, 40), desc=("chaotic evil", "A young red dragon, already arrogant and fiery.")),
+    _wyrmling("white_dragon_wyrmling", "White Dragon Wyrmling", "2", 16, "5d8+10", (14, 10, 14, 5, 10, 11), "dex 2, con 4, wis 2, cha 2",
+              "perception 4, stealth 2", "cold", "30, burrow 15, fly 60, swim 30",
+              mel("bite", "Bite", 4, "1d8+2 p; 1d4 cold"),
+              (sact("cold_breath", "Cold Breath", sv(A.CON, 12, half=True), cone(15), "5d8 cold", recharge=5, vfx="breath_cold"),),
+              (225, 235, 245), desc=("chaotic evil", "A frost-scaled hatchling of the arctic.")),
+    _wyrmling("black_dragon_wyrmling", "Black Dragon Wyrmling", "2", 17, "6d8+6", (15, 14, 13, 10, 11, 13), "dex 4, con 3, wis 2, cha 3",
+              "perception 4, stealth 4", "acid", "30, fly 60, swim 30",
+              mel("bite", "Bite", 4, "1d10+2 p; 1d4 acid"),
+              (sact("acid_breath", "Acid Breath", sv(A.DEX, 11, half=True), line(15), "5d8 acid", recharge=5, vfx="breath_acid"),),
+              (40, 40, 50), desc=("chaotic evil", "A swamp-dwelling hatchling that spits acid.")),
+    _wyrmling("green_dragon_wyrmling", "Green Dragon Wyrmling", "2", 17, "7d8+7", (15, 12, 13, 14, 11, 13), "dex 3, con 3, wis 2, cha 3",
+              "perception 4, stealth 3", "poison", "30, fly 60, swim 30",
+              mel("bite", "Bite", 4, "1d10+2 p; 1d6 poison"),
+              (sact("poison_breath", "Poison Breath", sv(A.CON, 11, half=True), cone(15), "6d6 poison", recharge=5, vfx="breath_poison"),),
+              (70, 150, 80), desc=("lawful evil", "A forest hatchling that breathes poison.")),
+    _wyrmling("blue_dragon_wyrmling", "Blue Dragon Wyrmling", "3", 17, "8d8+16", (17, 10, 15, 12, 11, 15), "dex 2, con 4, wis 2, cha 4",
+              "perception 4, stealth 2", "lightning", "30, burrow 15, fly 60, swim 30",
+              mel("bite", "Bite", 5, "1d10+3 p; 1d6 lightning"),
+              (sact("lightning_breath", "Lightning Breath", sv(A.DEX, 12, half=True), line(30), "10d6 lightning", recharge=5, vfx="breath_lightning"),),
+              (60, 110, 220), desc=("lawful evil", "A desert hatchling crackling with lightning.")),
+    _wyrmling("brass_dragon_wyrmling", "Brass Dragon Wyrmling", "1", 16, "3d8+3", (15, 10, 13, 10, 11, 13), "dex 2, con 3, wis 2, cha 3",
+              "perception 4, stealth 2", "fire", "30, burrow 15, fly 60",
+              mel("bite", "Bite", 4, "1d10+2 p"),
+              (sact("fire_breath", "Fire Breath", sv(A.DEX, 11, half=True), line(20), "4d6 fire", recharge=5, vfx="breath_fire", tags=(_BR,)),
+               sact("sleep_breath", "Sleep Breath", sv(A.CON, 11), cone(15), "", (cond("unconscious", 10, dmg_end=True),), None, recharge=5, vfx="sleep", tags=(_BR,))),
+              (200, 170, 60), desc=("chaotic good", "A talkative desert hatchling with fire and sleep breath.")),
+    _wyrmling("bronze_dragon_wyrmling", "Bronze Dragon Wyrmling", "2", 17, "5d8+10", (17, 10, 15, 12, 11, 15), "dex 2, con 4, wis 2, cha 4",
+              "perception 4, stealth 2", "lightning", "30, fly 60, swim 30",
+              mel("bite", "Bite", 5, "1d10+3 p"),
+              (sact("lightning_breath", "Lightning Breath", sv(A.DEX, 12, half=True), line(40), "8d6 lightning", recharge=5, vfx="breath_lightning", tags=(_BR,)),
+               sact("repulsion_breath", "Repulsion Breath", sv(A.STR, 12), cone(30), "", (), eff("push", 0, distance_ft=30), recharge=5, vfx="thunderwave", tags=(_BR,))),
+              (170, 120, 60), desc=("lawful good", "A coastal hatchling with lightning and repulsion breath.")),
+    _wyrmling("copper_dragon_wyrmling", "Copper Dragon Wyrmling", "1", 16, "4d8+4", (15, 12, 13, 14, 11, 13), "dex 3, con 3, wis 2, cha 3",
+              "perception 4, stealth 3", "acid", "30, climb 30, fly 60",
+              mel("bite", "Bite", 4, "1d10+2 p"),
+              (sact("acid_breath", "Acid Breath", sv(A.DEX, 11, half=True), line(20), "4d8 acid", recharge=5, vfx="breath_acid", tags=(_BR,)),
+               sact("slowing_breath", "Slowing Breath", sv(A.CON, 11), cone(15), "", (), eff("slowing_breath", 10, no_reactions=True, speed_halved=True, one_attack=True,
+                                                                                          action_or_bonus=True, save_ends=True), recharge=5, vfx="slow", tags=(_BR,))),
+              (180, 110, 60), desc=("chaotic good", "A hill-dwelling prankster hatchling.")),
+    _wyrmling("gold_dragon_wyrmling", "Gold Dragon Wyrmling", "3", 17, "8d8+24", (19, 14, 17, 14, 11, 16), "dex 4, con 5, wis 2, cha 5",
+              "perception 4, stealth 4", "fire", "30, fly 60, swim 30",
+              mel("bite", "Bite", 6, "1d10+4 p"),
+              (sact("fire_breath", "Fire Breath", sv(A.DEX, 13, half=True), cone(15), "4d10 fire", recharge=5, vfx="breath_fire", tags=(_BR,)),
+               sact("weakening_breath", "Weakening Breath", sv(A.STR, 13), cone(15), "", (), eff("weakened", 10, str_disadvantage=True), recharge=5, vfx="debuff_generic", tags=(_BR,))),
+              (230, 190, 60), desc=("lawful good", "A noble hatchling with fire and weakening breath.")),
+    _wyrmling("silver_dragon_wyrmling", "Silver Dragon Wyrmling", "2", 17, "6d8+18", (19, 10, 17, 12, 11, 15), "dex 2, con 5, wis 2, cha 4",
+              "perception 4, stealth 2", "cold", "30, fly 60",
+              mel("bite", "Bite", 6, "1d10+4 p"),
+              (sact("cold_breath", "Cold Breath", sv(A.CON, 13, half=True), cone(15), "4d8 cold", recharge=5, vfx="breath_cold", tags=(_BR,)),
+               sact("paralyzing_breath", "Paralyzing Breath", sv(A.CON, 13), cone(15), "", (cond("paralyzed", 10, save="con", dc=13),), None, recharge=5, vfx="hold_person", tags=(_BR,))),
+              (200, 205, 215), desc=("lawful good", "A kindly, mountain-dwelling hatchling.")),
+
+    mon("young_red_dragon", "Young Red Dragon", "large", DR, "10", 18, "17d10+85", (23, 10, 21, 14, 11, 19), ac_desc="natural armor",
+        speed="40, climb 40, fly 80", align="chaotic evil", saves="dex 4, con 9, wis 4, cha 8", skills="perception 8, stealth 4", imm="fire",
+        senses="blindsight 30, darkvision 120", lang="Common, Draconic",
+        actions=(mel("bite", "Bite", 10, "2d10+6 p; 1d6 fire", reach=10), mel("claw", "Claw", 10, "2d6+6 s"),
+                 sact("fire_breath", "Fire Breath", sv(A.DEX, 17, half=True), cone(30), "16d6 fire", recharge=5, vfx="breath_fire")),
+        multi=(("bite", "claw", "claw"),), gold="30d10", ai="boss", morale=0.0, icon="dragon-head", tint=(200, 40, 30),
+        tags=("dragon", "young", "red", "boss", "flying"), desc="A mature, arrogant fire-breathing dragon that hoards treasure."),
+
+    mon("adult_white_dragon", "Adult White Dragon", "huge", DR, "13", 18, "16d12+96", (22, 10, 22, 8, 12, 12), ac_desc="natural armor",
+        speed="40, burrow 30, fly 80, swim 40", align="chaotic evil", saves="dex 5, con 11, wis 6, cha 6", skills="perception 11, stealth 5", imm="cold",
+        senses="blindsight 60, darkvision 120", lang="Common, Draconic", traits=("ice_walk", "legendary_resistance"), tp={"legendary_resistance": 3},
+        actions=(mel("bite", "Bite", 11, "2d10+6 p; 1d8 cold", reach=10), mel("claw", "Claw", 11, "2d6+6 s"),
+                 mel("tail", "Tail", 11, "2d8+6 b", reach=15),
+                 sact("frightful_presence", "Frightful Presence", sv(A.WIS, 14), sphere(120, "self"), "", (cond("frightened", 10, save="wis", dc=14),), None,
+                      vfx="fear", tags=("creatures_of_dragons_choice", "must_be_aware", "immune_24h_on_success")),
+                 sact("cold_breath", "Cold Breath", sv(A.CON, 19, half=True), cone(60), "12d8 cold", recharge=5, vfx="breath_cold")),
+        multi=(("frightful_presence", "bite", "claw", "claw"), ("bite", "claw", "claw")),
+        legendary=((spec("detect", "Detect", "perception_check", cost=ActionCost.LEGENDARY, skill="perception"), 1),
+                   (mel("tail_attack", "Tail Attack", 11, "2d8+6 b", reach=15, cost=ActionCost.LEGENDARY, vfx="tail"), 1),
+                   (sact("wing_attack", "Wing Attack", sv(A.DEX, 19), sphere(10, "self"), "2d6+6 b", (cond("prone", -1),), None, cost=ActionCost.LEGENDARY,
+                         vfx="slam", tags=("then_fly_half_speed",)), 2)),
+        leg_n=3, gold="30d10", ai="boss", morale=0.0, icon="dragon-head", tint=(220, 235, 250),
+        tags=("dragon", "adult", "white", "boss", "legendary", "flying"), desc="A cruel, icy dragon that rules a frozen lair."),
+)

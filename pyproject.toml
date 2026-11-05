@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "emberdeep"
+version = "1.0.0"
+description = "Emberdeep: a multi-agent tactical fantasy RPG environment built on the 5e SRD 5.1 ruleset, for cooperation and social-dilemma research"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT (code); CC-BY-4.0 (SRD 5.1 content); CC-BY-3.0 (game-icons.net icons); OFL (fonts)" }
+dependencies = [
+    "numpy>=1.24",
+    "gymnasium>=0.29",
+    "pettingzoo>=1.24",
+]
+
+[project.optional-dependencies]
+fast = ["numba>=0.58"]
+render = ["pygame-ce>=2.4", "moderngl>=5.8", "pillow>=9"]
+train = ["torch>=2.0", "tensorboard"]
+dev = ["pytest>=7", "numba>=0.58", "pygame-ce>=2.4", "moderngl>=5.8", "pillow>=9"]
+all = ["numba>=0.58", "pygame-ce>=2.4", "moderngl>=5.8", "pillow>=9", "torch>=2.0", "tensorboard", "pytest>=7"]
+
+[project.scripts]
+emberdeep-play = "emberdeep.play:main"
+emberdeep-view = "emberdeep.viewer:main"
+emberdeep-bench = "emberdeep.bench:main"
+
+[tool.setuptools.packages.find]
+include = ["emberdeep*"]
+
+[tool.setuptools.package-data]
+emberdeep = [
+    "render/assets/fonts/*",
+    "render/assets/icons/*",
+    "render/shaders/*",
+    "scenarios/library/maps/*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
