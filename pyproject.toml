@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "emberdeep"
-version = "1.0.0"
+version = "1.1.0"
 description = "Emberdeep: a multi-agent tactical fantasy RPG environment built on the 5e SRD 5.1 ruleset, for cooperation and social-dilemma research"
 readme = "README.md"
 requires-python = ">=3.10"

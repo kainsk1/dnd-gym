@@ -27,10 +27,11 @@ def cbit(cond) -> int:
 # ----------------------------------------------------------------------------- items
 class ItemInstance:
     """A concrete item: a definition (ItemDef / WeaponDef / ArmorDef) with charges and quantity."""
-    __slots__ = ("def_", "charges", "qty", "uid", "penalty")
+    __slots__ = ("def_", "charges", "qty", "uid", "penalty", "attuned")
 
     def __init__(self, def_, charges: int | None = None, qty: int = 1, uid: int = 0):
         self.penalty = 0                 # corrosion etc.: subtracted from weapon damage
+        self.attuned = False             # attunement (ItemDef.attunement items work only while attuned)
         self.def_ = def_
         self.charges = getattr(def_, "charges", 0) if charges is None else charges
         self.qty = qty
@@ -61,9 +62,20 @@ class ItemInstance:
     def bonus(self) -> int:
         return getattr(self.def_, "bonus", 0)
 
+    @property
+    def active(self) -> bool:
+        """Does the item work?  Items that require attunement only work while attuned."""
+        return self.attuned or not getattr(self.def_, "attunement", False)
+
+    @property
+    def weight(self) -> float:
+        """Total weight in lb of the stack."""
+        return float(getattr(self.def_, "weight", 0.0) or 0.0) * self.qty
+
     def copy(self) -> "ItemInstance":
         n = ItemInstance(self.def_, self.charges, self.qty, self.uid)
         n.penalty = self.penalty
+        n.attuned = self.attuned
         return n
 
     def __repr__(self) -> str:  # pragma: no cover
@@ -91,6 +103,10 @@ class S:
     FLYING = 32768
     ESCAPED = 65536
     SUMMONED = 131072
+    MOUNTED = 1 << 18
+    CARRYING_RIDER = 1 << 19
+    SQUEEZING = 1 << 20
+    BURROWED = 1 << 21
 
 
 class ConditionInstance:
@@ -310,6 +326,11 @@ class Creature(Entity):
         self.spell_mods = {}
         self.fled = False
         self.speed_cache = None
+        self.speed_gold = -1            # gold total the speed cache was computed for (coins weigh 1 lb / 50)
+        self.enc_level = 0              # encumbrance: 0 none, 1 encumbered (variant), 2 heavily encumbered / over capacity
+        self.mount = -1                 # eid of the creature this one rides (mounted combat)
+        self.rider = -1                 # eid of the creature riding this one
+        self.mount_controlled = False   # mount acts on the rider's initiative (only Dash/Disengage/Dodge)
         self.monster_spell_dc = 0
         self.monster_spell_atk = 0
         self.sleeping_dc = 0
@@ -341,6 +362,7 @@ class Creature(Entity):
         self.ac_cache = None
         self.ab_cache = None
         self.speed_cache = None
+        self.speed_gold = -1
         self.hook_index = None
 
     def set_score(self, a: int, v: int) -> None:
@@ -451,6 +473,7 @@ class Creature(Entity):
         n.ac_cache = None
         n.ab_cache = None
         n.speed_cache = None
+        n.speed_gold = -1
         n.hook_index = None
         n.fov_cache = None
         n.known_ai_state = self.known_ai_state

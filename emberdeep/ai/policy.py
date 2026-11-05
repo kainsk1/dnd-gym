@@ -25,6 +25,7 @@ from emberdeep.core.actions import Act, ActKind
 from emberdeep.core.entities import INCAP_MASK, S
 from emberdeep.core.types import DIR_VECTORS, EntityKind, GameMode, Relation, TargetType
 
+_DIR_INDEX = {v: i for i, v in enumerate(DIR_VECTORS)}
 MAX_ACTS_PER_TURN = 48
 TRACE: list | None = None     # debugging: set to [] to record (round, eid, name, chosen tag, score, top candidates)
 THRESHOLD = 0.2
@@ -41,9 +42,19 @@ class UtilityPolicy(Policy):
     # ------------------------------------------------------------------------------------------ public API
     def act(self, world, eid: int) -> Act:
         c = world.entities[eid]
-        self.refresh_awareness(world, c)
-        sc = Scene(world, c)
         tm = turn_mem(world, c)
+        pm = tm.get("path")
+        if pm is not None and pm[0] and pm[1] == c.hp and world.last_step_valid and tm.get("last", (0,))[0] == 1 \
+                and c.ts.movement_left >= 5 and not c.cond_mask >> 3 & 1 and TRACE is None:
+            # fast path: keep walking the route planned earlier this turn (nothing hit us since)
+            nx, ny = pm[0][0]
+            d = _DIR_INDEX.get((nx - c.x, ny - c.y))
+            if d is not None and world.move_mask(eid)[d]:
+                turn_remember(world, c, path=(pm[0][1:], c.hp), n=tm.get("n", 0) + 1, last=(1, d, -1, None))
+                return Act(ActKind.MOVE, d)
+        if not tm or tm.get("last", (0,))[0] in (1, 2, 3, 5):      # first act of the turn, or we just moved
+            self.refresh_awareness(world, c)
+        sc = Scene(world, c)
         n = tm.get("n", 0) + 1
         if n > MAX_ACTS_PER_TURN:
             return end_turn()
@@ -184,7 +195,13 @@ class UtilityPolicy(Policy):
             a = self.ambush(sc, prof, allow_move)
             if a is not None:
                 return a
-        sv = survey(sc, prof)
+        sig = (c.x, c.y, tuple((f.eid, f.x, f.y) for f in sc.vis))
+        cc = tm.get("cc")
+        if cc is not None and cc[0] == sig and tm.get("last", (0,))[0] == 4 and w.last_step_valid:
+            a = self.reuse_attack(sc, cc[1])         # e.g. the second attack of a multiattack: nothing moved
+            if a is not None:
+                return a
+        sv = Survey() if self.survey_pointless(sc) else survey(sc, prof)
         urg = self.urgency(sc, prof)
         cands = list(sv.cands)
         best_now = max(cands, key=lambda x: x.score) if cands else None
@@ -214,6 +231,9 @@ class UtilityPolicy(Policy):
         if not cands:
             return end_turn()
         best = max(cands, key=lambda x: x.score)
+        if cands and best.tag.startswith("atk"):
+            top = sorted((x for x in cands if x.tag.startswith("atk")), key=lambda x: -x.score)[:3]
+            turn_remember(w, c, cc=(sig, tuple((x.score, x.act.arg, x.act.target, x.tag) for x in top)))
         if TRACE is not None:
             TRACE.append((w.round, sc.eid, c.name, best.tag, round(best.score, 2),
                           [(x.tag, round(x.score, 2)) for x in sorted(cands, key=lambda x: -x.score)[:4]]))
@@ -247,6 +267,45 @@ class UtilityPolicy(Policy):
         c = sc.c
         f = min(kf, key=lambda k: max(abs(k[1] - c.x), abs(k[2] - c.y)))
         return door_toward(sc, f[1], f[2])
+
+    @staticmethod
+    def reuse_attack(sc: Scene, top):
+        """Next best attack from the previous survey of this turn if it is still legal (positions unchanged)."""
+        w, c = sc.w, sc.c
+        abil = w.abilities(sc.eid)
+        mask = None
+        for score, k, tgt, tag in top:
+            t = w.entities[tgt]
+            if score < THRESHOLD or not t.present or t.status & (S.DEAD | S.DYING | S.STABLE | S.SURRENDERED):
+                continue
+            if k >= len(abil):
+                continue
+            ab = abil[k]
+            if not ab.usable(w, c) or not ab.valid_target(w, c, tgt):
+                continue
+            return Act(ActKind.ABILITY, k, tgt)
+        return None
+
+    @staticmethod
+    def survey_pointless(sc: Scene) -> bool:
+        """The action is spent and no bonus / free ability that the survey scores is left: skip the ability survey."""
+        c = sc.c
+        ts = c.ts
+        if not ts.action_used or ts.extra_actions or ts.attacks_left > 0 or ts.mseq:
+            return False
+        m = mem(c)
+        v = m.get("nbs")
+        if v is None or v[0] != c.version:
+            from emberdeep.ai.abinfo import info as _info
+            from emberdeep.ai.utility import _HANDLERS
+            from emberdeep.core.abilities import N_UNIVERSAL
+            from emberdeep.core.types import ActionCost
+            abil = sc.w.abilities(sc.eid)
+            need = any(ab.cost in (ActionCost.BONUS_ACTION, ActionCost.FREE) and _info(ab).role in _HANDLERS
+                       for ab in abil[N_UNIVERSAL:])
+            v = (c.version, need)
+            remember(c, nbs=v)
+        return not v[1]
 
     def goal(self, sc: Scene, prof: Profile):
         """Optional extra cell-score term ``f(cx, cy) -> array`` (subclasses)."""

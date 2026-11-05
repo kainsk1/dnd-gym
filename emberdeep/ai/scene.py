@@ -5,17 +5,21 @@ facts (the offence profile of each foe) are cached in the creature's per-turn me
 """
 from __future__ import annotations
 
+import weakref
+
 import numpy as np
 
 from emberdeep.ai.abinfo import info
 from emberdeep.ai.base import mem, remember, turn_mem, turn_remember
 from emberdeep.core import dice as D
 from emberdeep.core import resolution as R
+from emberdeep.core import fastmask as FM
 from emberdeep.core.abilities import N_UNIVERSAL
 from emberdeep.core.entities import INCAP_MASK, S
 from emberdeep.core.types import ActionCost as AC, Relation
 
 HOSTILE, NEUTRAL, TRUCE, ALLIED = 0, 1, 2, 3
+_SHARED_OFF = weakref.WeakKeyDictionary()     # world -> (round // 2, {(foe, defences): offence}) shared by its creatures
 _DOWNED = S.DYING | S.STABLE
 _GONE = S.DEAD | S.ESCAPED
 
@@ -24,7 +28,7 @@ class Scene:
     """Snapshot of what creature ``c`` knows and can do right now."""
     __slots__ = ("w", "c", "eid", "foes", "standing", "vis", "allies", "downed_allies", "downed_foes", "surrendered",
                  "neutrals", "_cellmap", "_est", "_mask", "hpf", "sq", "known", "fid", "_est_turn",
-                 "_est_dirty", "_thr", "_offc", "_fast", "adj_flag")
+                 "_est_dirty", "_thr", "_offc", "_fast", "adj_flag", "grids", "_vs", "_offl")
 
     def __init__(self, world, c):
         self.w = world
@@ -76,6 +80,9 @@ class Scene:
         self._est_dirty = False
         self._thr = {}
         self._offc = None
+        self.grids = None
+        self._vs = None
+        self._offl = {}
         self._fast = world.rules.diagonal_rule == "chebyshev"
         adj = False
         for f in standing:
@@ -85,10 +92,11 @@ class Scene:
         self.adj_flag = adj
 
     # ------------------------------------------------------------------------------------------ masks and estimates
-    def mask(self) -> np.ndarray:
+    def mask(self) -> "LazyMask":
+        """Lazily evaluated ``ability_mask``: ``mask[k]`` calls ``usable`` for that ability only (cached for the act)."""
         m = self._mask
         if m is None:
-            m = self._mask = self.w.ability_mask(self.eid)
+            m = self._mask = LazyMask(self.w, self.c)
         return m
 
     def est(self, k: int, f) -> tuple[float, float]:
@@ -98,8 +106,8 @@ class Scene:
         depends on (cover, adjacent-hostile disadvantage, conditions, effect counts, versions) so that repeated
         evaluation of the same matchup costs a dict lookup instead of a full attack-roll model."""
         c = self.c
-        key = (k, f.eid, int(self.w.cover(self.eid, f.eid)), self.adj_flag, f.cond_mask, c.cond_mask, c.version,
-               f.version, len(c.effects), len(f.effects))
+        key = (self.w.abilities(self.eid)[k].id, f.eid if f.is_pc else f.template_id, int(self.w.cover(self.eid, f.eid)), self.adj_flag, f.cond_mask,
+               c.cond_mask, len(c.inventory), R.compute_ac(self.w, f), len(c.effects), len(f.effects))
         r = self._est.get(key)
         if r is not None:
             return r
@@ -189,20 +197,70 @@ class Scene:
     def offense(self, f) -> dict:
         """Expected damage per round of foe/creature ``f`` against this creature.
 
-        Cached in the creature's memory: reused for two rounds while our own armor class is unchanged."""
+        Cached in the creature's memory and in a world-wide table shared by every observer with the same defences
+        (armour class, resistances): reused for two rounds."""
+        r0 = self._offl.get(f.eid)
+        if r0 is not None:
+            return r0
+        r0 = self._offense(f)
+        self._offl[f.eid] = r0
+        return r0
+
+    def _offense(self, f) -> dict:
         cache = self._offc
         if cache is None:
             cache = self._offc = mem(self.c).get("offc") or {}
+        c = self.c
+        ac = R.compute_ac(self.w, c)
         r = cache.get(f.eid)
-        ac = R.compute_ac(self.w, self.c)
         if r is not None and r[1] == ac and self.w.round - r[0] <= 2:
             return r[3]
-        d = _offense(self.w, f, self.c)
+        shared = _SHARED_OFF.get(self.w)
+        rd = self.w.round // 2
+        if shared is None or shared[0] != rd:
+            shared = (rd, {})
+            _SHARED_OFF[self.w] = shared
+        key = (f.eid if f.is_pc else f.template_id, ac, c.resist, c.immune, c.vuln, c.size_sq)
+        d = shared[1].get(key)
+        if d is None:
+            d = shared[1][key] = _offense(self.w, f, c)
         cache = dict(cache)
         cache[f.eid] = (self.w.round, ac, 0, d)
         self._offc = cache
-        remember(self.c, offc=cache)
+        remember(c, offc=cache)
         return d
+
+    def vis_sorted(self) -> list:
+        """Visible standing foes, nearest first (cached for the act)."""
+        v = self._vs
+        if v is None:
+            v = self._vs = sorted(self.vis, key=self.dist)
+        return v
+
+    def relevant(self) -> tuple:
+        """((index, ability, AbInfo), ...) of the abilities the survey scores; cached per ability-list version."""
+        c = self.c
+        m = mem(c).get("rel")
+        if m is None or m[0] != c.version:
+            abil = self.w.abilities(self.eid)
+            from emberdeep.ai.utility import _HANDLERS
+            out = []
+            for k, ab in enumerate(abil):
+                inf = info(ab)
+                if inf.role in _HANDLERS and inf.kw.get("maneuver") not in ("grapple", "shove_prone", "shove_push"):
+                    out.append((k, ab, inf))
+            m = (c.version, tuple(out))
+            remember(c, rel=m)
+        return m[1]
+
+    def has_real_attack(self, skip_k: int) -> bool:
+        """Is any non-universal damaging attack ability usable right now?"""
+        mask = self.mask()
+        abil = self.w.abilities(self.eid)
+        for k in range(N_UNIVERSAL, len(abil)):
+            if k != skip_k and info(abil[k]).role in ("attack", "aoe") and mask[k]:
+                return True
+        return False
 
     def threat(self, f) -> float:
         """How much damage removing ``f`` for a round prevents (floor keeps harmless foes worth something)."""
@@ -295,3 +353,39 @@ def adjacent_foes(sc: Scene, c=None) -> list:
     w = sc.w
     return [f for f in sc.standing if w.distance(me.eid, f.eid) <= max(1, sc.offense(f)["reach"])
             and w.distance(me.eid, f.eid) <= 1 + (sc.offense(f)["reach"] - 1)]
+
+
+class LazyMask:
+    """Drop-in for ``world.ability_mask(eid)`` that only evaluates the abilities somebody asks about."""
+    __slots__ = ("w", "c", "abil", "cache", "live", "gate", "modes")
+
+    def __init__(self, w, c):
+        self.w = w
+        self.c = c
+        self.abil = w.abilities(c.eid)
+        self.cache = {}
+        self.live = c.eid == w.active and w.pending_decision is None and not w.done and c.present
+        self.gate = None
+        self.modes = None
+
+    def __len__(self) -> int:
+        return len(self.abil)
+
+    def __getitem__(self, k: int) -> bool:
+        r = self.cache.get(k)
+        if r is None:
+            r = False
+            if self.live and 0 <= k < len(self.abil):
+                if self.gate is None:                      # economy gate: closed cost classes need no ``usable`` call
+                    self.gate = FM.ab_info(self.c, self.abil).gate
+                    self.modes = FM.economy_modes(self.w, self.c)
+                g = self.gate[k]
+                if g >= 0 and self.modes[g] == 0:
+                    self.cache[k] = False
+                    return False
+                try:
+                    r = bool(self.abil[k].usable(self.w, self.c))
+                except Exception:  # noqa: BLE001 - mirror ability_mask: a broken hook never crashes a policy
+                    r = False
+            self.cache[k] = r
+        return r

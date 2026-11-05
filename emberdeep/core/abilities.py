@@ -235,6 +235,8 @@ def basic_target_ok(world, actor, ab, eid: int) -> bool:
                                                  and t.present):
         return False
     is_self = t.eid == actor.eid
+    if actor.z < 0 and not is_self:                    # burrowed: must emerge (ASCEND) before acting on others
+        return False
     if actor.cond_mask & 2 and not is_self and (ab.cost in (AC.ATTACK,) or "attack" in ab.tags
                                                   or "damage" in ab.tags):
         for ci in actor.conditions.get(int(Condition.CHARMED), ()):
@@ -327,9 +329,22 @@ def _use_event(world, actor, ab, dst=-1) -> None:
 
 
 # ---- dash / disengage / dodge --------------------------------------------------------------
+def _controlled_mount(world, c):
+    if c.mount < 0:
+        return None
+    m = world.entities[c.mount]
+    return m if m.mount_controlled and m.present else None
+
+
 def _u_dash(world, c, ab, t, p):
     spend(world, c, ab)
-    c.ts.movement_left += R.base_speed(world, c)
+    m = _controlled_mount(world, c)
+    if m is not None:                                  # the controlled mount takes the Dash (its own speed)
+        m.ts.movement_left += R.base_speed(world, m)
+        m.ts.dashed = True
+        c.ts.movement_left = m.ts.movement_left
+    elif c.mount < 0:
+        c.ts.movement_left += R.base_speed(world, c)
     c.ts.dashed = True
     EF.add_effect(world, c, c, "dashed", -1, expire="start_bearer", silent=True)
     _use_event(world, c, ab)
@@ -337,6 +352,9 @@ def _u_dash(world, c, ab, t, p):
 
 def _u_disengage(world, c, ab, t, p):
     spend(world, c, ab)
+    m = _controlled_mount(world, c)
+    if m is not None:
+        m.ts.disengaged = True
     c.ts.disengaged = True
     EF.add_effect(world, c, c, "disengaged", -1, expire="start_bearer", silent=True)
     _use_event(world, c, ab)
@@ -344,18 +362,35 @@ def _u_disengage(world, c, ab, t, p):
 
 def _u_dodge(world, c, ab, t, p):
     spend(world, c, ab)
+    m = _controlled_mount(world, c)
+    if m is not None:
+        EF.add_effect(world, m, m, "dodge", -1, expire="start_bearer", silent=True)
     EF.add_effect(world, c, c, "dodge", -1, expire="start_bearer", silent=True)
     _use_event(world, c, ab)
 
 
 # ---- hide / search ---------------------------------------------------------------------------
 def _hostile_observers(world, c):
-    return [o for o in world.creatures_present()
-            if o.eid != c.eid and world.relation(o.eid, c.eid) == Relation.HOSTILE and o.conscious
-            and not o.status & S.SURRENDERED]
+    col = world.relations[:, c.faction].tolist()          # relation(o, c) is read from relations[o.faction, c.faction]
+    cf = c.faction
+    cid = c.eid
+    SURR = S.SURRENDERED
+    return [o for o in world.creatures if o.present and o.eid != cid and o.faction != cf and col[o.faction] == 0
+            and o.conscious and not o.status & SURR]
 
 
 def _u_hide_usable(world, c, ab):
+    memo = world._usable_memo
+    if memo is not None:
+        key = ("hide", c.eid)
+        r = memo.get(key)
+        if r is None:
+            r = memo[key] = _u_hide_usable_impl(world, c)
+        return r
+    return _u_hide_usable_impl(world, c)
+
+
+def _u_hide_usable_impl(world, c):
     if c.status & S.HIDDEN:
         return False
     obs = _hostile_observers(world, c)
@@ -444,8 +479,27 @@ def _u_help(world, c, ab, tid, p):
 
 
 # ---- ready ---------------------------------------------------------------------------------------
+def _has_attack_ability(world, c) -> bool:
+    """``bool(world.best_attack(c, None))`` without scoring: true iff some ability qualifies as an attack."""
+    for ab in world.abilities(c.eid):
+        if ab.kind not in ("weapon", "monster") and ab.id != "unarmed_strike":
+            continue
+        if "attack" not in ab.tags and ab.cost not in (AC.ATTACK, AC.ACTION) and not isinstance(ab, MonsterAttack):
+            continue
+        if not isinstance(ab, (WeaponAbility, MonsterAttack, UniversalAbility)):
+            continue
+        if isinstance(ab, UniversalAbility) and ab.id != "unarmed_strike":
+            continue
+        if ab.data.get("offhand"):
+            continue
+        if isinstance(ab, WeaponAbility) and ab.data["item"].qty <= 0:
+            continue
+        return True
+    return False
+
+
 def _u_ready_usable(world, c, ab):
-    return c.reaction_available and not c.status & S.READIED and bool(world.best_attack(c, None))
+    return c.reaction_available and not c.status & S.READIED and _has_attack_ability(world, c)
 
 
 def _u_ready(world, c, ab, t, p):
@@ -696,7 +750,7 @@ def best_potion(c):
 
 
 def _u_drink_usable(world, c, ab):
-    return best_potion(c) is not None and (c.hp < c.max_hp or c.status & S.DYING)
+    return (c.hp < c.max_hp or c.status & S.DYING) and best_potion(c) is not None
 
 
 def drink(world, actor, target, it) -> None:
@@ -850,20 +904,36 @@ def _est_unarmed(world, c, t):
     return estimate_attack(world, c, t, c.mods[ai] + c.prof, [[D.add_flat(dice, c.mods[ai]), 1, False]], False, 1)
 
 
+def _offer_truce_usable(w, c) -> bool:
+    cf = c.faction
+    f = 0
+    for v in w.relations[cf].tolist():
+        if f != cf and v == 0:                          # Relation.HOSTILE
+            return True
+        f += 1
+    return False
+
+
+def _has_potion(c) -> bool:
+    for i in c.inventory:
+        if i.kind == "potion":
+            return True
+    return False
+
+
 _U_USABLE = {
     "hide": _u_hide_usable, "ready": _u_ready_usable, "stand_up": _u_stand_usable, "pick_lock": _u_pick_usable,
     "escape_grapple": _u_escape_usable, "drink_potion": _u_drink_usable, "rest": _u_rest_usable,
     "surrender": lambda w, c, ab: not c.status & S.SURRENDERED,
     "give_gold": lambda w, c, ab: c.gold > 0,
-    "give_potion": lambda w, c, ab: any(i.kind == "potion" for i in c.inventory),
+    "give_potion": lambda w, c, ab: _has_potion(c),
     "administer_potion": lambda w, c, ab: best_potion(c) is not None,
     "dash": lambda w, c, ab: R.base_speed(w, c) > 0,
     "unarmed_strike": lambda w, c, ab: not c.status & S.SURRENDERED,
     "grapple": lambda w, c, ab: not c.status & S.SURRENDERED,
     "shove_prone": lambda w, c, ab: not c.status & S.SURRENDERED,
     "shove_push": lambda w, c, ab: not c.status & S.SURRENDERED,
-    "offer_truce": lambda w, c, ab: any(f != c.faction and w.relations[c.faction, f] == Relation.HOSTILE
-                                        for f in range(w.relations.shape[0])),
+    "offer_truce": lambda w, c, ab: _offer_truce_usable(w, c),
     "accept_truce": lambda w, c, ab: bool(w.truce_offers),
     "parley": lambda w, c, ab: not c.status & S.SURRENDERED,
     "stabilize": lambda w, c, ab: True,
@@ -943,23 +1013,25 @@ def estimate_attack(world, actor, target, bonus: int, damage, ranged: bool, reac
                       [list(x) for x in damage], ranged=ranged)
     ctx.dist = world.distance(actor.eid, target.eid)
     ctx.cover = world.cover(actor.eid, target.eid) if ctx.dist > 1 else 0
+    ctx.extra["estimate"] = True                     # hooks must not roll dice / mutate state: they add ``est_mix`` instead
     R.gather_advantage(world, ctx)
-    for h in R.hooks(actor, "attack_mods"):
-        try:
-            h.attack_mods(world, ctx)
-        except Exception:  # noqa: BLE001
-            pass
-    for h in R.hooks(target, "defense_mods"):
-        try:
-            h.defense_mods(world, ctx)
-        except Exception:  # noqa: BLE001
-            pass
+    rng_state = world.rng.bit_generator.state
+    try:
+        for h in R.hooks(actor, "attack_mods"):
+            try:
+                h.attack_mods(world, ctx)
+            except Exception:  # noqa: BLE001
+                pass
+        for h in R.hooks(target, "defense_mods"):
+            try:
+                h.defense_mods(world, ctx)
+            except Exception:  # noqa: BLE001
+                pass
+    finally:
+        world.rng.bit_generator.state = rng_state    # safety net: an estimate never consumes randomness
     adv = R.net_adv(ctx.adv, ctx.dis)
-    ac = R.compute_ac(world, target) + (0, 2, 5, 0)[ctx.cover] + ctx.ac_bonus
+    base_ac = R.compute_ac(world, target) + (0, 2, 5, 0)[ctx.cover] + ctx.ac_bonus
     bb = bonus + sum(D.average(d) for d in ctx.bonus_dice)
-    ph, pc = p_hit_roll(int(round(bb)), ac, adv, ctx.crit_min)
-    if ctx.auto_crit:
-        pc = ph
     dmg = 0.0
     for comp in damage:
         mult, _ = R.damage_multiplier(world, target, int(comp[1]), bool(comp[2]) or spell)
@@ -970,7 +1042,31 @@ def estimate_attack(world, actor, target, bonus: int, damage, ranged: bool, reac
         mult, _ = R.damage_multiplier(world, target, int(comp[1]), bool(comp[2]) or spell)
         d = D.parse(comp[0])
         cd += sum(n * (s + 1) / 2.0 for n, s in d.terms) * mult
-    return ph, ph * dmg + pc * cd
+
+    def value(ac_adj: int, killed: bool):
+        if killed:
+            return 0.0, 0.0
+        ph, pc = p_hit_roll(int(round(bb)), base_ac + ac_adj, adv, ctx.crit_min)
+        if ctx.auto_crit:
+            pc = ph
+        return ph, ph * dmg + pc * cd
+
+    # expected-value effects of random defences (Sanctuary, Mirror Image): (probability, AC change, attack lost)
+    outcomes = [(1.0, 0, False)]
+    for p, ac_adj, killed in ctx.extra.get("est_mix", ()):
+        nxt = []
+        for w, a0, k0 in outcomes:
+            nxt.append((w * (1 - p), a0, k0))
+            nxt.append((w * p, a0 + ac_adj, k0 or killed))
+        outcomes = nxt
+    if len(outcomes) == 1:
+        return value(0, False)
+    ph_t = e_t = 0.0
+    for w, a0, k0 in outcomes:
+        ph, e = value(a0, k0)
+        ph_t += w * ph
+        e_t += w * e
+    return ph_t, e_t
 
 
 # =============================================================================== weapon abilities
@@ -1333,6 +1429,62 @@ class FeatureAbility(Ability):
         self.data["hook"].use(world, actor, self, eid, point)
 
 
+# =============================================================================== mounted combat
+_MOUNT_FDEF = None
+
+
+def _mount_fdef(id_: str, name: str):
+    from emberdeep.data.schema import FeatureDef
+    return FeatureDef(id_, name, "engine", 1, "free", f"{name} (SRD Mounted Combat)")
+
+
+class MountAbility(Ability):
+    """``mount`` (climb onto an adjacent willing mount, target = the mount) and ``dismount`` (step off).  Both cost half
+    of the rider's speed in movement and no action (SRD: Mounting and Dismounting).  Creature-specific slots."""
+    __slots__ = ()
+
+    def usable(self, world, actor):
+        if not world.rules.mounts or not can_act(actor):
+            return False
+        if self.id == "mount":
+            return actor.mount < 0 and self.id not in actor.ts.used_ids and bool(world.mount_candidates(actor))
+        return actor.mount >= 0 and self.id not in actor.ts.used_ids and \
+            actor.fstate.get("mount", {}).get("own", 0) >= world.mount_cost(actor)
+
+    def valid_target(self, world, actor, eid):
+        if self.id != "mount":
+            return eid == actor.eid
+        if eid < 0 or eid >= len(world.entities) or eid == actor.eid:
+            return False
+        return world.mount_valid(actor, world.entities[eid])
+
+    def valid_point(self, world, actor, x, y):
+        return False
+
+    def execute(self, world, actor, eid, point):
+        if self.id == "mount":
+            world.mount_up(actor, world.entities[eid])
+        else:
+            world.dismount(actor)
+
+    def estimate(self, world, actor, target):
+        return (0.0, 0.0)
+
+
+def mount_abilities(world, c) -> list:
+    """The 'mount' / 'dismount' abilities that apply to ``c`` right now (empty unless the world has mounts)."""
+    if not world.rules.mounts or c.kind != EntityKind.CREATURE:
+        return []
+    out = []
+    if c.mount >= 0:
+        out.append(MountAbility("dismount", "Dismount", "feature", AC.FREE, TargetType.SELF, 0, 0, 0, None, -1,
+                                _mount_fdef("dismount", "Dismount"), "horse-head", "dismount", ("mount", "util"), {}))
+    elif world._mount_count and c.rider < 0 and "mount" not in c.tags:
+        out.append(MountAbility("mount", "Mount", "feature", AC.FREE, TargetType.ALLY, 1, 1, 0, None, -1,
+                                _mount_fdef("mount", "Mount"), "horse-head", "mount", ("mount", "util"), {}))
+    return out
+
+
 # =============================================================================== spell abilities
 class SpellAbility(Ability):
     __slots__ = ()
@@ -1484,9 +1636,10 @@ def build_abilities(world, c):
         spec.append(_spell_ability(sp))
     # ---- items -----------------------------------------------------------------------------------------------------
     for it in c.inventory:
-        ab = _item_ability(it)
+        ab = _item_ability(it) if it.active else None
         if ab is not None:
             spec.append(ab)
+    spec.extend(mount_abilities(world, c))
     spec = dedupe_and_prioritise(c, spec)
     legendary = []
     if md is not None:

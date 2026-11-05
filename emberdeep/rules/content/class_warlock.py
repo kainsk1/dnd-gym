@@ -22,8 +22,8 @@ from emberdeep.rules.registry import Feature, register_feature
 # ======================================================================================== fiend patron
 @register_feature("dark_ones_blessing")
 class DarkOnesBlessing(Feature):
-    """When you reduce a hostile creature to 0 HP (it dies), you gain temporary HP equal to your CHA modifier + warlock
-    level (minimum 1).  Deviation: only triggers on kills, not on knocking out a PC-like creature."""
+    """When you reduce a hostile creature to 0 HP (it dies, or drops dying), you gain temporary HP equal to your CHA
+    modifier + warlock level (minimum 1).  A creature downed and later killed by the same warlock pays out once."""
     HOOKS = frozenset({"on_kill"})
 
     def on_kill(self, world, me, victim):

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = ["make_aec", "make_parallel", "make_gym", "make_vector", "list_scenarios", "scenario_info", "EnvConfig",
            "__version__"]

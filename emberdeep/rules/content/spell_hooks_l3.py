@@ -159,9 +159,15 @@ class CalmEmotionsSpell(SpellHook):
 
     def cast(self, world, ctx):
         c, sp = ctx.caster, ctx.spell
-        opt = pick_option(world, c, sp.id, ("suppress", "indifferent"), "suppress")
-        ctx.extra["option"] = opt
         tg = [t for t in ctx.targets if t.ctype == CreatureType.HUMANOID and t.present]
+        # scripted heuristic: suppress when friends are charmed/frightened (or no hostile is in the area), else make the
+        # hostile humanoids indifferent
+        mask = (1 << int(Condition.CHARMED)) | (1 << int(Condition.FRIGHTENED))
+        friends_hurt = any(allied(world, c, t) and t.cond_mask & mask for t in tg)
+        foes = [t for t in tg if hostile(world, c, t)]
+        opt = pick_option(world, c, sp.id, ("suppress", "indifferent"),
+                          "suppress" if friends_hurt or not foes else "indifferent")
+        ctx.extra["option"] = opt
         ctx.targets = tg
         betray(world, ctx, False)
         for t in tg:
@@ -310,6 +316,9 @@ class DispelMagic(SpellHook):
             for cond in list(t.conditions):
                 for ci in list(t.conditions.get(cond, ())):
                     lv = _link_level(world, ci.link)
+                    if lv is None:
+                        rec = t.fstate.get("spell_conds", {}).get(ci.uid)
+                        lv = rec[1] if rec else None
                     if lv is not None and beats(lv):
                         links.add(ci.link)
                         R.remove_condition(world, t, cond, uid=ci.uid)
@@ -423,6 +432,36 @@ class HypnoticPattern(SpellHook):
 _ENERGY = ("acid", "cold", "fire", "lightning", "thunder")
 
 
+def likely_energy(world, caster) -> str:
+    """Scripted choice for Protection from Energy: the energy type most present in the attacks and spells of the hostile
+    creatures that can see the caster (monster actions / save actions / known spells); fire when nothing stands out."""
+    from emberdeep.core.factory import lookup_spell
+    from emberdeep.core.types import DamageType
+    names = {int(getattr(DamageType, n.upper())): n for n in _ENERGY}
+    score: dict[str, float] = {}
+
+    def add(dt, w=1.0):
+        n = names.get(int(dt))
+        if n is not None:
+            score[n] = score.get(n, 0.0) + w
+    for o in world.creatures:
+        if not o.present or o.status & _DOWN or not hostile(world, caster, o):
+            continue
+        md = o.monster_def
+        if md is not None:
+            for a in (*md.actions, *md.bonus_actions, *md.reactions):
+                for ds in getattr(a, "damage", ()) or ():
+                    add(ds.type, 1.5)
+        for sid in (*o.spells, *o.cantrips):
+            sp = lookup_spell(sid)
+            if sp is not None:
+                for ds in sp.damage:
+                    add(ds.type, 1.0)
+    if not score:
+        return "fire"
+    return max(sorted(score), key=lambda k: score[k])
+
+
 @register_spell_hook("protection_from_energy")
 class ProtectionFromEnergySpell(SpellHook):
     """Resistance to acid, cold, fire, lightning or thunder (the caster's choice) for an hour."""
@@ -430,7 +469,7 @@ class ProtectionFromEnergySpell(SpellHook):
 
     def cast(self, world, ctx):
         c, sp = ctx.caster, ctx.spell
-        opt = pick_option(world, c, sp.id, _ENERGY, "fire")
+        opt = pick_option(world, c, sp.id, _ENERGY, likely_energy(world, c))
         ctx.extra["option"] = opt
         for t in ctx.targets[:1]:
             EF.add_effect(world, c, t, "protection_from_energy", sp.duration, {"type": opt}, link=ctx.link)
@@ -440,7 +479,7 @@ class ProtectionFromEnergySpell(SpellHook):
 # =============================================================================== remove curse
 @register_spell_hook("remove_curse")
 class RemoveCurse(SpellHook):
-    """Ends every curse on the target (bestow curse, cursed-item grips)."""
+    """Ends every curse on the target (bestow curse, cursed-item grips, mummy rot, lycanthropy)."""
 
     def cast(self, world, ctx):
         t = world.entities[ctx.target] if ctx.target >= 0 else None
@@ -448,7 +487,7 @@ class RemoveCurse(SpellHook):
             return True
         n = 0
         for e in list(t.effects):
-            if e.ID in ("bestow_curse", "cursed_gold"):
+            if e.ID in ("bestow_curse", "cursed_gold", "mummy_rot", "lycanthropy"):
                 EF.remove_effect(world, t, e, "remove_curse")
                 n += 1
         ctx.extra["lifted"] = n

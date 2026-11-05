@@ -48,6 +48,9 @@ class HUDProtocol:
     def on_frame(self, frame: FrameState) -> None: ...          # new authoritative state (after animations of a step finish)
     def on_event(self, event: dict, frame: FrameState, view: ViewInfo) -> None: ...  # at the moment its animation lands
     def update(self, dt: float, view: ViewInfo) -> None: ...
+    # Optional: ``dirty`` (bool attribute, valid after ``update``). When False the last drawn surface is still
+    # exact, so the renderer may skip clear + draw + texture upload and reuse the previous HUD texture.
+    dirty: bool = True
     def draw(self, surface, view: ViewInfo) -> None: ...        # surface: pygame.Surface (SRCALPHA, screen size), cleared by caller
     def handle_event(self, ev, view: ViewInfo) -> UICommand | None: ...  # pygame event; None = not consumed
     def begin_human_choice(self, agent_id: str, actions: list[ActionDescriptor]) -> None: ...

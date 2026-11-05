@@ -13,6 +13,10 @@ from emberdeep.render.ui.combat_log import COND_NAMES, dmg_name, humanize
 from emberdeep.render.ui.theme import Color
 
 
+def _norm(x: str) -> str:
+    return "".join(ch for ch in x.lower() if ch.isalnum())
+
+
 @dataclass
 class Floater:
     text: str
@@ -49,6 +53,7 @@ class FloatingLayer:
         self.floaters: list[Floater] = []
         self.bubbles: list[Bubble] = []
         self._last_spawn: dict[int, tuple[float, int]] = {}
+        self._casts: list[tuple[float, str, set]] = []
         self._rng = random.Random(3)
 
     # ------------------------------------------------------------------ spawn
@@ -126,13 +131,25 @@ class FloatingLayer:
             add(dst, "Death save ✓" if data.get("success") else "Death save ✗",
                 T.GREEN if data.get("success") else T.RED, size=15, role="body_bold", life=1.6)
         elif et == ET.EFFECT_START:
-            add(dst, str(data.get("name") or humanize(data.get("effect", ""))), T.CYAN, size=15, role="body_bold")
+            nm = str(data.get("name") or humanize(data.get("effect", "")))
+            n = _norm(nm) or _norm(str(data.get("effect", "")))
+            now = self.hud.t
+            dup = any(now - t0 < 0.6 and n == cn and (dst in who) for t0, cn, who in self._casts)
+            if not dup:
+                add(dst, nm, T.CYAN, size=15, role="body_bold")
         elif et == ET.CONCENTRATION_END:
             add(dst, "Concentration lost", T.PURPLE, size=15, role="body_bold")
         elif et == ET.SPELL_CAST:
+            nm0 = str(data.get("name") or humanize(data.get("spell", "")))
+            self._casts = [c for c in self._casts if self.hud.t - c[0] < 1.0][-8:]
+            self._casts.append((self.hud.t, _norm(nm0) or _norm(str(data.get("spell", ""))),
+                                {src, dst, *[int(x) for x in (data.get("targets") or [])]}))
             add(src, str(data.get("name") or humanize(data.get("spell", ""))), T.PURPLE, size=17, role="title",
                 life=1.4)
         elif et == ET.ABILITY_USE:
+            nm0 = str(data.get("name") or humanize(data.get("ability", "")))
+            self._casts = [c for c in self._casts if self.hud.t - c[0] < 1.0][-8:]
+            self._casts.append((self.hud.t, _norm(nm0) or _norm(str(data.get("ability", ""))), {src, dst}))
             add(src, str(data.get("name") or humanize(data.get("ability", ""))), T.YELLOW, size=16, role="title",
                 life=1.3)
         elif et == ET.COUNTERSPELL:

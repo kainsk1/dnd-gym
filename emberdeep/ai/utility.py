@@ -59,7 +59,7 @@ class Pot:
 
 
 class Survey:
-    __slots__ = ("cands", "pot", "heal_pot", "best_attack", "has_attack_now", "use_stale")
+    __slots__ = ("cands", "pot", "heal_pot", "best_attack", "has_attack_now", "use_stale", "best_ed")
 
     def __init__(self):
         self.cands: list[Cand] = []
@@ -68,6 +68,7 @@ class Survey:
         self.best_attack = 0.0
         self.has_attack_now = False
         self.use_stale = True
+        self.best_ed: dict = {}
 
 
 def ab_act(k: int, target: int = -1, point=None) -> Act:
@@ -178,22 +179,15 @@ def attack_value(sc, prof, inf, f, ph: float, ed: float, ab=None) -> float:
 def survey(sc, prof) -> Survey:
     sv = Survey()
     mask = sc.mask()
-    abil = sc.w.abilities(sc.eid)
-    n = len(abil)
     post = []
-    for k in range(n):
+    for k, ab, inf in sc.relevant():
         if not mask[k]:
             continue
-        ab = abil[k]
-        inf = info(ab)
         role = inf.role
-        h = _HANDLERS.get(role)
-        if h is None:
-            continue
         if role == "sattack":
             post.append((k, ab, inf))
             continue
-        h(sv, sc, prof, k, ab, inf)
+        _HANDLERS[role](sv, sc, prof, k, ab, inf)
     for (k, ab, inf) in post:
         _h_sattack(sv, sc, prof, k, ab, inf)
     if sv.pot:
@@ -235,14 +229,27 @@ def _h_attack(sv, sc, prof, k, ab, inf) -> None:
     if man in ("grapple", "shove_prone", "shove_push"):
         return        # maneuvers are scored by the tactical layer (prone / push), not as damage
     if man == "unarmed_strike":
+        if sc.has_real_attack(k):
+            return    # clearly dominated by a real weapon / natural attack
         pen = 0.9
-    for f in targets:
+    far = 0
+    for f in sc.vis_sorted():
         d = sc.dist(f)
+        if d > maxr + 1:
+            far += 1
+            if far > 3:
+                break               # only the nearest few out-of-range foes matter for movement planning
         ph, ed = sc.est(k, f) if d <= maxr + 1 else sc.est_far(k, f)
         if ed <= 0 and not inf.conds:
             continue
         if not ctype_ok(inf, f):
             continue
+        key = (f.eid, inf.melee)
+        bed = sv.best_ed.get(key, 0.0)
+        if ed < 0.85 * bed and not inf.conds and not inf.slot:
+            continue                    # clearly dominated by another weapon / attack of the same kind on this foe
+        if ed > bed:
+            sv.best_ed[key] = ed
         v = attack_value(sc, prof, inf, f, ph, ed, ab) * pen
         _record_pot(sv, f, inf, v - cost)
         if d <= maxr and ab.valid_target(w, c, f.eid):

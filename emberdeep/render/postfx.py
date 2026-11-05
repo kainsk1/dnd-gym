@@ -109,11 +109,13 @@ class PostFX:
             set_uniform(p, k, v)
         self.vao_comp.render(moderngl.TRIANGLE_STRIP)
 
-    def draw_ui(self, surf_bytes: bytes | None) -> None:
-        if surf_bytes is None:
+    def draw_ui(self, surf_bytes: bytes | None, reuse: bool = False) -> None:
+        """Composite the HUD texture; ``reuse=True`` skips the upload (HUD unchanged since last upload)."""
+        if surf_bytes is None and not reuse:
             return
         ctx = self.ctx
-        self.ui_tex.write(surf_bytes)
+        if not reuse:
+            self.ui_tex.write(surf_bytes)
         self.out_fbo.use()
         ctx.viewport = (0, 0) + self.full
         ctx.enable(moderngl.BLEND)

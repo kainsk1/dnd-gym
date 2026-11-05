@@ -38,6 +38,7 @@ def give(w, eid, item_id, qty=1):
     it = F.make_item(item_id, qty)
     assert it is not None, item_id
     w.give_item(w.entities[eid], it)
+    w.attune(eid, it)                    # v1.1: attunement items only work while attuned (no-op for others)
     return it
 
 

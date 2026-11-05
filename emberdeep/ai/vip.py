@@ -28,6 +28,9 @@ class VipPolicy(UtilityPolicy):
     def __init__(self, seed=None):
         super().__init__(VIP, name="vip", seed=seed)
 
+    def hunt(self, sc, prof, gate):
+        return None          # an escort target never goes looking for trouble
+
     def fight(self, sc, prof, gate):
         w = sc.w
         near = [f for f in sc.vis if sc.dist(f) <= 7]

@@ -489,7 +489,8 @@ class SpiritualWeaponZone(GenericZone):
 @register_zone("minor_illusion")
 class MinorIllusionZone(GenericZone):
     """An illusory object (5-ft cube) that blocks sight until a creature studies it (INT (Investigation) vs the spell
-    DC, rolled once per hostile creature near it at a round start) or walks into it."""
+    DC, rolled once per hostile creature near it at a round start) or walks into it.  Discernment is *per observer*
+    (``World.discern_illusion``): the creature that sees through it looks past the image, everyone else is still blocked."""
     TRIGGERS = ()
 
     def is_opaque(self, z):
@@ -497,4 +498,4 @@ class MinorIllusionZone(GenericZone):
 
     def on_enter(self, world, z, c):
         if c.eid != z.source:
-            Z.remove_zone(world, z, "discerned")
+            world.discern_illusion(z, c.eid)

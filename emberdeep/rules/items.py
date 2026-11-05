@@ -20,7 +20,8 @@ class Burning(Effect):
 
     def on_turn_start(self, world, me):
         R.make_damage(world, world.entities[self.source] if self.source >= 0 else None, me,
-                      [[self.params.get("dice", "1d4"), int(DamageType.FIRE), False]], source="burning",
+                      [[self.params.get("dice") or str(self.params.get("damage", "1d4")).split()[0],
+                        int(DamageType.FIRE), False]], source="burning",
                       apply_mods=False)
 
     def on_turn_end(self, world, me):

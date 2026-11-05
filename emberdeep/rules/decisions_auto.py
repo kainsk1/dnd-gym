@@ -14,6 +14,11 @@ def default_auto_decider(world, decision) -> int:
     opts = decision.options
     if len(opts) <= 1:
         return 0
+    if k == DecisionKind.POST_ROLL or ctx.get("post_roll"):
+        for i, o in enumerate(opts):                       # content marks the option scripted creatures take
+            if i and o.data.get("auto"):
+                return i
+        return 0
     if k == DecisionKind.OPPORTUNITY_ATTACK:
         t = world.entities[ctx["target"]] if "target" in ctx else None
         return 1 if t is None or t.present else 0

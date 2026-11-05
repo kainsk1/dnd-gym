@@ -25,14 +25,14 @@ def check_invariants(w):
         assert c.death_succ <= 3 and c.death_fail <= 3
         if c.status & Status.DEAD:
             assert not c.present and c.hp == 0
-        if c.present and c.z == 0:
+        if c.present and c.z == 0 and c.mount < 0:       # riders share their mount's square
             assert 0 <= c.x and c.x + c.size_sq <= w.map.W and 0 <= c.y and c.y + c.size_sq <= w.map.H
             for (x, y) in c.cells():
-                assert not w.map.blocked[y, x], (c.name, x, y)
+                assert not w.map.blocked[y, x] or 'incorporeal_movement' in c.trait_ids or c.size_sq > 1, (c.name, x, y)
                 assert occ[y, x] in (c.eid,) or occ[y, x] >= 0
                 if seen.setdefault((x, y), c.eid) != c.eid:
                     assert c.eid in w.map.shared.get((x, y), ()) or seen[(x, y)] in w.map.shared.get((x, y), ()), \
-                        "creatures overlap without sharing"
+                        ("creatures overlap without sharing", c.name, seen[(x, y)], c.eid, x, y)
         if c.present and c.status & Status.DYING:
             assert c.hp == 0 and c.has(13)
     for e in w.drain_events():

@@ -96,6 +96,8 @@ class EventType(IntEnum):
     LEVER = 71            # src -> dst=lever | data: state
     INTERACT = 72         # src -> dst=object | data: kind (altar/fountain/relic...) , result
     GOLD_CHANGE = 73      # dst | amount (signed) | data: reason
+    MOUNT = 74            # src=rider -> dst=mount | data: free (bool)
+    DISMOUNT = 75         # src=rider -> dst=mount | data: reason ('voluntary','fell','mount_down','forced'), prone (bool)
 
     # --- perception & stealth --------------------------------------------------------
     HIDE = 80             # src | data: roll, total, success

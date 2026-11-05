@@ -5,10 +5,9 @@ from __future__ import annotations
 from emberdeep.core import dice as D
 from emberdeep.core import effects as EF
 from emberdeep.core import resolution as R
-from emberdeep.core.decisions import DecisionOption
 from emberdeep.core.events import EventType as ET
 from emberdeep.core.entities import S
-from emberdeep.core.types import ActionCost, Condition, DecisionKind, Relation, TargetType
+from emberdeep.core.types import ActionCost, Condition, Relation, TargetType
 from emberdeep.rules.content.class_common import InitFeature, choices_of, fab
 from emberdeep.rules.registry import Feature, register_feature
 
@@ -67,21 +66,33 @@ class JackOfAllTrades(Feature):
 
 @register_feature("song_of_rest")
 class SongOfRest(Feature):
-    """During a short rest, you and every friendly creature in the party that is wounded regains an extra d6 HP (d8
-    at 9th ...).  Deviation: granted to each wounded ally present once per short rest."""
-    HOOKS = frozenset({"on_short_rest"})
+    """During a short rest, you and every friendly creature who can hear your performance and regains hit points by
+    spending Hit Dice regains an extra d6 (d8 at 9th, d10 at 13th, d12 at 17th), once per creature per rest.
+    Uses the engine's ``observe_hit_die`` hook, called by ``World.short_rest`` for every Hit Die spent."""
+    HOOKS = frozenset({"observe_hit_die", "on_short_rest"})
 
-    def on_short_rest(self, world, me):
+    def _sides(self, me) -> int:
         lv = me.class_levels.get("bard", me.level)
         tab = self.params.get("die_by_level")
-        sides = tab[min(lv, len(tab) - 1)] if tab else 6
-        if not sides:
+        return int(tab[min(lv, len(tab) - 1)]) if tab else 6
+
+    def on_short_rest(self, world, me):
+        self.state["done"] = ()            # the bard's own turn in the rest loop: a new rest starts fresh next time
+
+    def observe_hit_die(self, world, spender, amount):
+        me = world.entities[self.me]
+        sides = self._sides(me)
+        if not sides or not me.present or me.status & 128 or me.cond_mask & R.INCAP_MASK:
             return
-        for o in world.creatures:
-            if not o.present or o.status & 128 or o.hp >= o.max_hp:
-                continue
-            if o is me or world.relation(me.eid, o.eid) == Relation.ALLIED:
-                R.heal(world, me, o, D.roll(world.rng, f"1d{sides}"), "song_of_rest")
+        if spender is not me and world.relation(me.eid, spender.eid) != Relation.ALLIED:
+            return
+        if spender.cond_mask & (1 << int(Condition.DEAFENED)) or not spender.present:
+            return
+        done = self.state.get("done", ())
+        if spender.eid in done:
+            return                          # once per creature per rest
+        self.state["done"] = tuple(done) + (spender.eid,)
+        R.heal(world, me, spender, D.roll(world.rng, f"1d{sides}"), "song_of_rest")
 
 
 @register_feature("font_of_inspiration")
@@ -107,41 +118,76 @@ class BonusProficienciesLore(InitFeature):
 
 @register_feature("cutting_words")
 class CuttingWords(Feature):
-    """College of Lore, reaction: spend a Bardic Inspiration use to subtract a die from an enemy attack roll against
-    you or an adjacent ally (the enemy must be within 60 ft and visible).  Before the roll for allies (ALLY_ATTACKED),
-    after seeing the roll for yourself (ON_ATTACKED, only offered when the die can turn the hit into a miss).
-    Deviation: attack rolls only (not ability checks or damage rolls)."""
-    HOOKS = frozenset({"reaction_options", "apply_reaction"})
-
-    def _ok(self, world, me, ctx):
-        if me.resources.get("bardic_inspiration", 0) < 1:
-            return False
-        a = ctx.attacker
-        if a is None or world.relation(me.eid, a.eid) != Relation.HOSTILE:
-            return False
-        return world.distance(me.eid, a.eid) <= 12 and world.sees(me.eid, a.eid)
+    """College of Lore, reaction: when a creature you can see within 60 ft makes an attack roll, an ability check or a
+    damage roll, spend a Bardic Inspiration use, roll the die and subtract it from the roll.  You may decide after
+    seeing the d20 (``observe_d20``; a ``POST_ROLL`` decision for agents) or the damage dice (``observe_damage``).
+    Only hostile creatures are offered; attack rolls against creatures hostile to the bard are ignored, as are rolls
+    that cannot change (nat 20 attack, checks without a DC, hits the die cannot turn into misses)."""
+    HOOKS = frozenset({"observe_d20", "observe_damage", "reaction_options"})
+    POST_ROLL = True
 
     def reaction_options(self, world, me, kind, ctx):
-        if kind == DecisionKind.ALLY_ATTACKED:
-            if not self._ok(world, me, ctx):
-                return ()
-        elif kind == DecisionKind.ON_ATTACKED:
-            if ctx.extra.get("magic_missile") or ctx.target.eid != me.eid or not self._ok(world, me, ctx):
-                return ()
-            sides = _die_sides(me, self.params)
-            if ctx.roll == 20 or ctx.total - ctx.ac >= sides:
-                return ()
-        else:
-            return ()
-        return [DecisionOption("cutting_words", "Cutting Words", {"hook": self.ID, "kind": int(kind)})]
+        return ()               # marker so the engine snapshots for agent bards
 
-    def apply_reaction(self, world, me, kind, ctx, option):
+    def _ok(self, world, me, who) -> bool:
+        if me.resources.get("bardic_inspiration", 0) < 1 or not me.reaction_available or not R.can_react(me):
+            return False
+        if who is None or who is me or world.relation(me.eid, who.eid) != Relation.HOSTILE:
+            return False
+        return world.distance(me.eid, who.eid) <= 12 and world.sees(me.eid, who.eid)
+
+    def _spend(self, world, me, who, what: str) -> int:
+        sides = _die_sides(me, self.params)
         me.reaction_available = False
         me.resources["bardic_inspiration"] = me.resources.get("bardic_inspiration", 0) - 1
+        die = D.roll(world.rng, f"1d{sides}")
+        world.emit(ET.REACTION, me.eid, who.eid if who is not None else -1, die, -1,
+                   {"ability": "cutting_words", "name": "Cutting Words (" + what + ")", "vfx": "debuff_generic"})
+        return die
+
+    def observe_d20(self, world, ctx, roll, total):
+        me = world.entities[self.me]
         sides = _die_sides(me, self.params)
-        if kind == DecisionKind.ALLY_ATTACKED:
-            ctx.bonus_dice.append(f"-1d{sides}")
+        if isinstance(ctx, R.AttackCtx):
+            who = ctx.attacker
+            if ctx.extra.get("magic_missile") or ctx.auto_hit or roll in (1, 20):
+                return 0
+            if world.relation(me.eid, ctx.target.eid) == Relation.HOSTILE or not self._ok(world, me, who):
+                return 0
+            margin = total - ctx.ac
+            if margin < 0 or margin >= sides:
+                return 0                      # misses already / the die can never turn the hit into a miss
+            what, key = "attack", {"what": "attack", "roll": roll, "total": total, "dc": ctx.ac}
+            auto = True
+        elif isinstance(ctx, R.CheckCtx):
+            who = ctx.checker
+            if ctx.dc is None or ctx.passive or not self._ok(world, me, who):
+                return 0
+            margin = total - ctx.dc
+            if margin < 0 or margin >= sides:
+                return 0
+            what, key = "check", {"what": "check", "roll": roll, "total": total, "dc": ctx.dc}
+            auto = False                      # scripted bards save their uses for combat
         else:
-            ctx.ac_bonus += D.roll(world.rng, f"1d{sides}")
-        world.emit(ET.REACTION, me.eid, ctx.attacker.eid, 0, int(kind),
-                   {"ability": "cutting_words", "name": "Cutting Words", "vfx": "debuff_generic"})
+            return 0
+        from emberdeep.rules.content.class_common import post_roll_ask
+        key.update({"source": "cutting_words", "roller": who.eid})
+        if not post_roll_ask(world, me.eid, "cutting_words", f"Cutting Words (d{sides}, {what})", auto, key):
+            return 0
+        return -self._spend(world, me, who, what)
+
+    def observe_damage(self, world, dctx, rolled):
+        me = world.entities[self.me]
+        who, t = dctx.attacker, dctx.target
+        if who is None or t is None or who is t or not self._ok(world, me, who):
+            return 0
+        if world.relation(me.eid, t.eid) == Relation.HOSTILE:
+            return 0
+        sides = _die_sides(me, self.params)
+        from emberdeep.rules.content.class_common import post_roll_ask
+        auto = rolled >= t.hp or rolled >= 2 * sides + 2
+        if not post_roll_ask(world, me.eid, "cutting_words", f"Cutting Words (d{sides}, damage)", auto,
+                             {"what": "damage", "total": rolled, "dc": t.hp, "source": "cutting_words",
+                              "roller": who.eid}):
+            return 0
+        return self._spend(world, me, who, "damage")

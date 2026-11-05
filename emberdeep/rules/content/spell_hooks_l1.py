@@ -51,6 +51,12 @@ class _CharmBase(SpellHook):
             cs = sp.conditions[0]
             if R.add_condition(world, t, cs.condition, c.eid, cs.duration, None, ctx.dc, False, 0, ctx.link):
                 EF.add_effect(world, c, t, "charmed_friend", cs.duration, {"spell": sp.id}, link=ctx.link)
+                edge = EF.find_effect(c, "charmer_edge")
+                if edge is None:
+                    EF.add_effect(world, c, c, "charmer_edge", cs.duration, {}, link=ctx.link)
+                    edge = EF.find_effect(c, "charmer_edge")
+                if edge is not None:
+                    edge.state["targets"] = tuple(edge.state.get("targets", ())) + (t.eid,)
         return True
 
 

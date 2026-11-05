@@ -55,6 +55,7 @@ ALL_HOOKS = (
     "observe_d20", "ally_save_mods", "modify_healing", "death_save_mods", "veto_exhaustion", "avoids_opportunity",
     "can_pass_through", "may_share_space", "ignores_difficult", "weapon_ability", "ability_blocked", "target_filter",
     "economy_mods", "spell_range_mult", "ignore_components", "before_cast", "on_fall", "projectile_block",
+    "casting_time", "on_targeted", "observe_hit_die", "observe_damage", "after_attacked",
 )
 
 

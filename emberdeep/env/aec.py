@@ -14,7 +14,7 @@ from pettingzoo import AECEnv
 
 from emberdeep.core.actions import Act
 from emberdeep.env.config import EnvConfig
-from emberdeep.env.core import EmberdeepCore, StepOutcome
+from emberdeep.env.core import _UNSET, EmberdeepCore, StepOutcome
 from emberdeep.env.rewards import COMPONENTS, N_COMP
 
 
@@ -110,13 +110,14 @@ class EmberdeepAEC(AECEnv):
         for a in self.agents:
             self._cumulative_rewards[a] += self.rewards[a]
         self._sync_done_flags()
-        self.infos = {a: self._info(a, out) for a in self.agents}
+        dec = core.decider_agent()
+        self.infos = {a: self._info(a, out, dec) for a in self.agents}
         self.agent_selection = self._select()
         if self._renderer is not None:
             self._renderer.after_step(out)
 
-    def _info(self, agent: str, out: StepOutcome | None) -> dict:
-        info = self.core.info_for(agent, out)
+    def _info(self, agent: str, out: StepOutcome | None, decider=_UNSET) -> dict:
+        info = self.core.info_for(agent, out, decider, comp=False)
         i = self.core.agent_index[agent]
         row = self._comp_acc[i]
         nz = np.nonzero(row)[0]

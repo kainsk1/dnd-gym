@@ -437,3 +437,17 @@ class CharacterBuild:
     gold: int = 10
     icon: str = ""                          # token icon override
     portrait_tint: tuple[int, int, int] = (200, 170, 90)
+    # --- v1.1 (multiclassing): ((class_id, level, subclass), ...); empty -> single class (class_id, level, subclass).
+    # With several entries ``class_id``/``subclass`` mirror the first (primary) entry and ``level`` is the total level.
+    # Per-class spell choices live in ``choices['class_spells'|'class_cantrips']`` = {class_id: tuple}; the first class
+    # falls back to ``spells``/``cantrips``.  ``choices['mc_skills']`` = {class_id: tuple of Skill} for the extra skill
+    # a multiclass entry may grant.
+    classes: tuple[tuple[str, int, str], ...] = ()
+
+    def class_list(self) -> tuple[tuple[str, int, str], ...]:
+        """The effective ``(class_id, level, subclass)`` entries."""
+        return tuple(self.classes) if self.classes else ((self.class_id, self.level, self.subclass),)
+
+    @property
+    def total_level(self) -> int:
+        return sum(lv for _, lv, _ in self.class_list())

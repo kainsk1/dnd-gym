@@ -23,16 +23,16 @@ Engine requests that would make deviations exact: `docs/dev/contract_requests/fe
 * "Once per turn" limits use the key `(round, active creature)` so they also hold on other creatures' turns.
 * Bonus-action attacks (Frenzy, Horde Breaker) use `class_common.bonus_attack`, which runs a weapon ability without
   spending the Attack action.
-* Deterministic: all randomness is `world.rng`. `peek_rng` copies the generator to *predict* (never consume) dice.
+* Deterministic: all randomness is `world.rng`. Post-roll features use `after_d20` / `observe_d20` (no peeking at the RNG).
 
 ## Barbarian
 
 | id | implementation | deviation |
 |---|---|---|
-| `rage` | Bonus action, resource `rage`, not in heavy armor. Effect `rage` (10 rounds): +2 (+3 at 9th) damage on STR-based melee weapon/unarmed attacks, resistance to B/P/S (also magical), advantage on STR checks/saves, ends when the bearer's turn ends without attacking a hostile or taking damage, or on unconscious; sets `S.RAGING`; ends concentration. | Casting spells while raging is not blocked (barbarians have no spells). |
+| `rage` | Bonus action, resource `rage`, not in heavy armor. Effect `rage` (10 rounds): +2 (+3 at 9th) damage on STR-based melee weapon/unarmed attacks, resistance to B/P/S (also magical), advantage on STR checks/saves, ends when the bearer's turn ends without attacking a hostile or taking damage, or on unconscious; sets `S.RAGING`; ends concentration. | Spell abilities are blocked while raging (`ability_blocked`). |
 | `unarmored_defense_barbarian` | exemplar (`rules/features.py`). | |
 | `reckless_attack` | Free toggle before the first attack of the turn: effect `reckless` until the start of the next turn: advantage on STR melee attacks, attacks against the bearer have advantage. | |
-| `danger_sense` | Advantage on DEX saves unless blinded, deafened or incapacitated. | The "effects you can see" clause is not modelled (all DEX saves). |
+| `danger_sense` | Advantage on DEX saves unless blinded, deafened or incapacitated. | Saves forced by a creature you cannot see get no advantage; traps/hazards (no source) always count. |
 | `fast_movement` | `speed_bonus` +10 ft unless wearing heavy armor. | |
 | `frenzy` | Berserker: bonus-action melee attack while raging (`bonus_attack`); the rage ends with +1 exhaustion if Frenzy was used during it. | Frenzy is "chosen" by using the ability, not when starting the rage. |
 | `extra_attack` | exemplar. | |
@@ -41,21 +41,21 @@ Engine requests that would make deviations exact: `docs/dev/contract_requests/fe
 
 | id | implementation | deviation |
 |---|---|---|
-| `bardic_inspiration` | Bonus action on an ally (not self) within 60 ft, resource `bardic_inspiration` (CHA mod, long rest); effect `bardic_inspiration_die` (d6/d8, 100 rounds). | See next row. |
-| (die usage) | The holder's attack rolls and saving throws: the next d20 is predicted from an RNG copy; the die is added (and consumed) only when it turns a failure into a success. | Not applied to ability checks; automatic instead of a player choice (CR 8). |
+| `bardic_inspiration` | Bonus action on an ally (not self) within 60 ft, resource `bardic_inspiration` (CHA mod, long rest); effect `bardic_inspiration_die` (d6/d8, 100 rounds). | The die is a *decision* (`POST_ROLL`) after the d20 is known. |
+| (die usage) | `after_d20` on the holder's attack rolls, saving throws and ability checks against a DC: offered (only when the die could turn the failure into a success) as a `POST_ROLL` decision to agents; scripted holders always accept. No RNG peeking. | Contested checks (grapple, shove, escape): the defender rolls first and the initiator's die is offered against that total. |
 | `jack_of_all_trades` | +half proficiency on non-proficient ability checks (also passive) and initiative. | |
-| `song_of_rest` | `on_short_rest`: every wounded ally (and self) heals an extra d6 (d8 at 9th). | Not tied to spending Hit Dice. |
+| `song_of_rest` | `observe_hit_die`: each Hit Die spent in a short rest by you or an allied creature that is not deafened heals an extra d6 (d8/d10/d12 by level), once per creature per rest. | |
 | `font_of_inspiration` | 5th level: Bardic Inspiration uses return on a short rest. | |
 | `expertise_bard` | Factory applies `build.expertise`; marker. | |
 | `bonus_proficiencies_lore` | `InitFeature`: three skills from `choices['lore_skills']`. | |
-| `cutting_words` | Reaction (resource `bardic_inspiration`): `-d6/d8` on an enemy attack roll against an adjacent ally (`ALLY_ATTACKED`, before the roll) or against the bard (`ON_ATTACKED`, after the roll; offered only when it can turn the hit into a miss, via `ac_bonus`). Enemy within 60 ft and visible. | Attack rolls only; allies must be adjacent to the bard (engine's `protectors`). |
+| `cutting_words` | Reaction (resource `bardic_inspiration`): hostile creature you see within 60 ft makes an attack roll or ability check (`observe_d20`, after the d20) or a weapon/spell damage roll (`observe_damage`): subtract the die. A `POST_ROLL` decision for agents; scripted bards react to attacks that would hit by less than the die and to lethal damage, and keep their uses for combat (no checks). | Attack rolls against creatures hostile to the bard are ignored. |
 
 ## Cleric
 
 | id | implementation | deviation |
 |---|---|---|
 | `channel_divinity` | Marker; uses are the `channel_divinity` resource (short rest). | |
-| `turn_undead` | Action: undead within 30 ft that see the cleric make a WIS save vs spell DC; failure: effect `turned` (10 rounds, no reactions, ends on damage) + FRIGHTENED. | "Turned" is frightened + no reactions (no forced Dash); undead only. |
+| `turn_undead` | Action: undead within 30 ft that see the cleric make a WIS save vs spell DC; failure: effect `turned` (10 rounds, no reactions, ends on damage; each turn it Dashes away, or Dodges when cornered) + FRIGHTENED. | Undead only (Turn the Unholy: fiends and undead). |
 | `destroy_undead` | Companion of Turn Undead: failed-save undead with CR <= 1/2 (table by level) are destroyed. | |
 | `preserve_life` | Life domain: action, pool 5 x level shared out (most wounded first) among allies within 30 ft, each up to half max HP; not undead/constructs. | |
 | `disciple_of_life` | `on_cast`: each target of a leveled healing spell heals an extra 2 + slot level. | |
@@ -78,7 +78,7 @@ Engine requests that would make deviations exact: `docs/dev/contract_requests/fe
 | `archery`, `defense`, `dueling`, `protection`, `two_weapon_fighting` | exemplars. | |
 | `great_weapon_fighting` | Two-handed / versatile-in-two-hands melee: the first damage component's dice are pre-rolled with 1s and 2s rerolled once (crit aware). | |
 | `second_wind` | exemplar; short-rest resource verified. | |
-| `action_surge` | Free, resource `action_surge`: resets Action + Attack-action bookkeeping. | Only after the Action is spent and all attacks made. |
+| `action_surge` | Free, resource `action_surge`: resets Action + Attack-action bookkeeping. | Usable once the Action is spent (using it earlier would change nothing: the total is the same). |
 | `improved_critical` | Champion: `crit_min` 19 on weapon/unarmed attacks. | |
 | `extra_attack` | exemplar (tested at 5th). | |
 
@@ -87,7 +87,7 @@ Engine requests that would make deviations exact: `docs/dev/contract_requests/fe
 | id | implementation | deviation |
 |---|---|---|
 | `unarmored_defense_monk` | exemplar (`rules/features.py`): AC 10 + DEX + WIS, no armor and no shield. | |
-| `martial_arts` | Re-registered subclass of the exemplar: die by level plus the bonus-action unarmed strike after the Attack action (`martial_arts_bonus`). | DEX for monk weapons only for finesse weapons (CR 5). |
+| `martial_arts` | Re-registered subclass of the exemplar: die by level plus the bonus-action unarmed strike after the Attack action (`martial_arts_bonus`). | Monk weapons (shortsword, simple melee without two-handed/heavy) use DEX via `weapon_ability` while unarmored. |
 | `ki` | Marker; resource `ki` (monk level, short rest). | |
 | `flurry_of_blows` | Bonus action, 1 ki, after the Attack action: two unarmed strikes (second retargets if the first target is gone). | |
 | `patient_defense` | Bonus action, 1 ki: Dodge. | |
@@ -104,7 +104,7 @@ Engine requests that would make deviations exact: `docs/dev/contract_requests/fe
 | id | implementation | deviation |
 |---|---|---|
 | `divine_sense` | Action, resource `divine_sense`: celestials/fiends/undead within 60 ft (not behind total cover) are revealed (`hit_history`, `aware`, `SPOTTED`). | |
-| `lay_on_hands` | Action, touch: heals min(pool, missing HP) from the `lay_on_hands` pool (revives at 0 HP); `lay_on_hands_cure` spends 5 to remove poisoned. Not undead/constructs. | Heals as much as needed (no partial amounts). |
+| `lay_on_hands` | Action, touch: heals min(pool, missing HP) from the `lay_on_hands` pool (revives at 0 HP); `lay_on_hands_cure` spends 5 to remove poisoned. Not undead/constructs. | The amount (1 / 5 / 10 / as much as needed) is a `SPELL_CHOICE` decision for agents; scripted paladins heal what is needed. The cure option removes poison or a disease (wasting disease). |
 | `divine_smite` | exemplar (verified: slot cost, 2d8 +1d8/level, +1d8 vs undead/fiends, crit doubling, rider decision `smite_N`). | |
 | `divine_health` | Marker. | The engine has no disease. |
 | `sacred_weapon` | Action, channel: effect `sacred_weapon` (10 rounds) +CHA (min 1) to weapon attack rolls, attacks magical; the bearer sheds light (20 ft bright + 20 ft dim) while it lasts. | |
@@ -143,11 +143,11 @@ Engine requests that would make deviations exact: `docs/dev/contract_requests/fe
 | `metamagic` | Container; each chosen option grants a FREE toggle that arms it for the next spell cast this turn; points are paid and the option applied when the spell is cast (`on_cast`). | |
 | `empowered_spell` | Spell damage dice pre-rolled; up to CHA-mod lowest dice below average rerolled. | |
 | `extended_spell` | Doubles `remaining` of effects/conditions/zones the spell created. | |
-| `quickened_spell` | Arm before using the Action; the spell then costs the bonus action. | Cannot be armed after the Action is spent (CR 4). |
-| `twinned_spell` | Single-target spell (at the cast slot) is cast again for free on the nearest enemy / most wounded ally; concentration is shared. | |
-| `careful_spell` | Up to CHA-mod allies in the area take half damage (none if no half clause). | Conditions not prevented, no save roll (CR 3). |
-| `heightened_spell` | Implemented via `force_save_mods`. | Not offered until CR 3 exists. |
-| `distant_spell`, `subtle_spell` | Registered. | Not offered (CR 4). |
+| `quickened_spell` | Arm before using the Action; the spell then costs the bonus action. | Armed any time the bonus action is free (engine hook `casting_time`); bonus-action-spell rule applies. |
+| `twinned_spell` | Single-target spell (at the cast slot) is cast again for free on the nearest valid enemy / most wounded ally in range; no second target = nothing spent; concentration is shared. | The twin cast offers Counterspell a second time. |
+| `careful_spell` | Up to CHA-mod allies in the area take half damage (none if no half clause). | `force_save_mods`: protected allies automatically succeed (no damage if no half clause, no conditions). |
+| `heightened_spell` | `before_cast` + `force_save_mods`: first hostile save against the spell has disadvantage; points paid on cast. | |
+| `distant_spell`, `subtle_spell` | Distant: `spell_range_mult` (x2, touch 30 ft); Subtle: `ignore_components` (not stopped by Silence, cannot be Counterspelled). | |
 | `dragon_ancestor` | Ancestry in `choices`; double proficiency on CHA checks vs dragons. | |
 | `draconic_resilience` | +1 HP/level (factory `hp_per_level`), unarmored AC 13 + DEX. | |
 
@@ -156,12 +156,12 @@ Engine requests that would make deviations exact: `docs/dev/contract_requests/fe
 | id | implementation | deviation |
 |---|---|---|
 | `pact_magic` | Marker; pact slots from the factory, recharge in `short_rest` (verified). | |
-| `dark_ones_blessing` | `on_kill`: temp HP = CHA mod + level (min 1). | Only when the hostile dies (not for downed PC-like creatures). |
+| `dark_ones_blessing` | `on_kill`: temp HP = CHA mod + level (min 1). | `on_kill` also fires when a hostile drops to 0 HP (dying); once per creature. |
 | `eldritch_invocations` | Container (level and pact prerequisites enforced). | |
 | `agonizing_blast` | +CHA to each Eldritch Blast beam. | |
 | `repelling_blast` | A Large-or-smaller creature hit by Eldritch Blast is pushed 10 ft. | |
 | `armor_of_shadows` | Permanent unarmored AC 13 + DEX. | Equivalent to at-will Mage Armor. |
-| `devils_sight` | `senses['devils_sight']=120` and darkvision 120. | Does not pierce magical darkness (CR 9). |
+| `devils_sight` | `senses['devils_sight']=120` and darkvision 120. | Pierces magical darkness (engine `devils_sight` sense). |
 | `eldritch_sight` | Detect magic at will (`innate = -1`). | |
 | `fiendish_vigor` | Action: 8 temporary HP. | |
 | `beguiling_influence` | Deception + Persuasion proficiency. | |
@@ -169,7 +169,7 @@ Engine requests that would make deviations exact: `docs/dev/contract_requests/fe
 | `thirsting_blade` | Two attacks per Attack action with the pact of the blade. | |
 | `thief_of_five_fates`, `mire_the_mind`, `sign_of_ill_omen` | Once per long rest cast bane / slow / bestow curse with a pact slot. | |
 | `beast_speech`, `book_of_ancient_secrets`, `eyes_of_the_rune_keeper`, `gaze_of_two_minds`, `mask_of_many_faces`, `misty_visions`, `voice_of_the_chain_master` | Registered, inert. | Spells outside the engine list / flavour. |
-| `eldritch_spear` | Registered, inert. | Needs CR 4. |
+| `eldritch_spear` | Eldritch Blast range 300 ft (`spell_range_mult`). | Targets must be inside `rules.sight_radius` (default 24 squares = 120 ft, even if lit); raise it for the full range. |
 | `pact_boon` | Container. | |
 | `pact_of_the_blade` | Action: magical finesse "Pact Blade" (rapier stats) equipped, proficient. | |
 | `pact_of_the_chain` | Action: summons the familiar (`choices['familiar']`, default imp) as a scripted ally in the initiative order. | |
@@ -180,7 +180,7 @@ Engine requests that would make deviations exact: `docs/dev/contract_requests/fe
 | id | implementation | deviation |
 |---|---|---|
 | `arcane_recovery` | Short rest, once per long rest (resource): slots of combined level <= ceil(level/2), none above 5th, highest first. | |
-| `sculpt_spells` | Up to 1 + spell level allies take no damage from your evocation area spells. | Conditions are not prevented (CR 3). |
+| `sculpt_spells` | Up to 1 + spell level allies automatically succeed and take no damage / conditions from your evocation spells. | |
 | `evocation_savant`, `arcane_tradition` | Markers. | |
 
 ## Common
@@ -198,6 +198,6 @@ Engine requests that would make deviations exact: `docs/dev/contract_requests/fe
 | `damage_resistance` | Resistance to the ancestry damage type. | |
 | `dwarf_speed` | +10 ft when Strength is below the armor requirement (cancels the penalty). | |
 | `naturally_stealthy` | `can_hide`: a creature at least one size larger adjacent to the hider and nearer the observer. | |
-| `halfling_nimbleness` | Registered inert. | CR 6. |
+| `halfling_nimbleness` | `can_pass_through` larger creatures. | |
 | `skill_versatility` | `InitFeature`: two skills from `choices['racial_skills']`. | |
 | `brave`, `dwarven_resilience`, `fey_ancestry`, `gnome_cunning`, `keen_senses`, `lucky`, `relentless_endurance`, `savage_attacks` | exemplars in `rules/traits.py` (not re-implemented). | |

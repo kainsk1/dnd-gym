@@ -91,6 +91,10 @@ class HeroPolicy(UtilityPolicy):
         a = self.explore(sc, prof)
         if a is not None:
             return a
+        from emberdeep.core.types import ObjectiveKind
+        if any(not st.done and not st.failed and st.spec.kind == ObjectiveKind.DEFEAT_ALL
+               for st in w.objectives) and sc.mask()[U["search"]] and not c.ts.action_used:
+            return ab_act(U["search"])               # look for whatever is still hiding
         return end_turn()
 
     # ------------------------------------------------------------------------------------------ short rests
@@ -196,7 +200,9 @@ class HeroPolicy(UtilityPolicy):
         """Heroes carrying the prize run for the exit even with enemies around (grab and go)."""
         g0 = mem(sc.c).get("gold0")
         guard_up = any('guardian' in f.tags and not f.cond_mask >> 13 & 1 for f in sc.foes)
-        if g0 is not None and (sc.c.gold >= g0 + 100 or guard_up) and sc.c.ts.movement_left >= 5:
+        rel = (getattr(getattr(sc.w, "scenario_runtime", None), "cfg", {}) or {}).get("relic_escape") or {}
+        carrying = bool(rel.get("item")) and sc.c.find_item(rel["item"]) is not None
+        if g0 is not None and (sc.c.gold >= g0 + 100 or guard_up or carrying) and sc.c.ts.movement_left >= 5:
             a = self.escape_act(sc)
             if a is not None:
                 return a
@@ -220,13 +226,18 @@ class HeroPolicy(UtilityPolicy):
             remember(c, gold0=c.gold)
             g0 = c.gold
         guard_up = any('guardian' in f.tags and not f.cond_mask >> 13 & 1 for f in sc.foes)
-        laden = (c.gold >= g0 + 100 or guard_up) and "escaped" in payoff   # grab and go: run with the loot
+        rel = cfg.get("relic_escape") or {}
+        item = rel.get("item")
+        carrying = bool(item) and any(x.find_item(item) is not None for x in [c] + [m for m in sc.allies if m.is_pc])
+        if item and not carrying and not (w.round >= 0.6 * w.rules.max_rounds):
+            return False                                   # the relic comes first
+        laden = (c.gold >= g0 + 100 or guard_up or carrying) and ("escaped" in payoff or bool(item))
         if not laden and any(not f.cond_mask >> 13 & 1 and ((sc.dist(f) <= 8 and (f in sc.vis or f.eid in c.aware)) or (f in sc.vis and sc.dist(f) <= 12 and not any(
                 t == 'stationary' or t.startswith('guard:') for t in f.tags))) for f in sc.standing):
             return False                                   # awake hostiles around: deal with them first
         mates = [x for x in sc.allies if x.is_pc and x.conscious] + [c]
         avg = sum(x.hp / max(1, x.max_hp) for x in mates) / len(mates)
-        late = w.round >= 0.45 * w.rules.max_rounds
+        late = w.round >= min(0.45 * w.rules.max_rounds, 90)
         open_obj = [st for st in w.objectives if not st.done and not st.failed and st.spec.kind not in (
             ObjectiveKind.ESCAPE, ObjectiveKind.PROTECT, ObjectiveKind.SURVIVE)]
         if open_obj and not late and avg > 0.35:
@@ -243,7 +254,7 @@ class HeroPolicy(UtilityPolicy):
     def treasure_altars(sc: Scene) -> list:
         """Altars that pay out gold when used (cursed coffer, hoard pedestals)."""
         return [o for o in sc.w.objects if o.present and o.kind == EntityKind.ALTAR and any(
-            k in (o.hook or "") for k in ("coffer", "treasure", "hoard", "donat")) and "donat" not in (o.hook or "")]
+            k in (o.hook or "") for k in ("coffer", "treasure", "hoard", "relic")) and "donat" not in (o.hook or "")]
 
     def escape_act(self, sc: Scene) -> Act | None:
         c, w = sc.c, sc.w
@@ -325,7 +336,30 @@ class HeroPolicy(UtilityPolicy):
                 best = (d, o)
         if best is not None:
             return ("obj", best[1].eid, w.round + 25)
-        return None
+        return self._sweep_goal(sc, dist_ap)
+
+    def _sweep_goal(self, sc: Scene, dist_ap):
+        """Nothing left to explore but hostiles must still be found (hidden / sleeping): sweep unvisited 6x6 blocks."""
+        from emberdeep.core.types import ObjectiveKind
+        c, w = sc.c, sc.w
+        if not any(not st.done and not st.failed and st.spec.kind == ObjectiveKind.DEFEAT_ALL
+                   for st in w.objectives):
+            return None
+        vb = set(mem(c).get("blocks") or ())
+        vb.add((c.x // 6, c.y // 6))
+        remember(c, blocks=frozenset(vb))
+        ys, xs = np.nonzero(np.isfinite(dist_ap))
+        best = None
+        for x, y in zip(xs[::3], ys[::3]):
+            if (int(x) // 6, int(y) // 6) in vb:
+                continue
+            d = float(dist_ap[y, x])
+            if best is None or d < best[0]:
+                best = (d, int(x), int(y))
+        if best is None:
+            remember(c, blocks=frozenset())          # everything swept once: start over
+            return None
+        return ("cell", best[1], best[2], w.round + 20)
 
     def _pursue(self, sc: Scene, goal):
         c, w = sc.c, sc.w

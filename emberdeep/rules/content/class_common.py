@@ -3,7 +3,7 @@
 Contents
 --------
 * helpers: ``fab`` (build a :class:`FeatureAbility`), ``bonus_attack`` (an attack that costs no Attack-action
-  slot), ``peek_rng`` (look at the next dice without consuming them), ``last_event``, ``choices_of``,
+  slot), ``last_event``, ``choices_of``,
   ``class_level``, ``is_heavy_armor`` ...
 * :class:`InitFeature` / :class:`ChoiceFeature`: features that need to know the *build choices*
   (``CharacterBuild.choices``: metamagic, invocations, pact boon, hunter's prey ...).  The factory attaches only the
@@ -14,7 +14,6 @@ Contents
 """
 from __future__ import annotations
 
-import copy
 import inspect
 import logging
 
@@ -26,8 +25,8 @@ from emberdeep.rules.registry import FEATURES, Feature, hooks_of, register_featu
 
 log = logging.getLogger(__name__)
 
-__all__ = ["fab", "bonus_attack", "peek_rng", "last_event", "choices_of", "class_level", "is_heavy_armor",
-           "InitFeature", "ChoiceFeature", "summon_ally", "protect_ally_damage", "recover_slots", "peek_d20", "preroll_with_rerolls", "find_hook_on", "turn_key", "ceil_half"]
+__all__ = ["fab", "bonus_attack", "last_event", "choices_of", "class_level", "is_heavy_armor",
+           "InitFeature", "ChoiceFeature", "summon_ally", "protect_ally_damage", "recover_slots", "preroll_with_rerolls", "find_hook_on", "turn_key", "ceil_half", "post_roll_kind", "post_roll_ask"]
 
 
 # ======================================================================================== helpers
@@ -41,6 +40,24 @@ def fab(hook, id_: str, name: str, cost: ActionCost, target: TargetType = Target
     d.update(data)
     return FeatureAbility(id_, name, "feature", cost, target, range_sq, range_sq, reach_sq, None, -1,
                           getattr(hook, "fdef", None), "", vfx or id_, tuple(tags), d)
+
+
+def post_roll_kind():
+    """``DecisionKind.POST_ROLL`` (a d20 is known; spend a die / feature to change it)."""
+    from emberdeep.core.types import DecisionKind
+    return DecisionKind.POST_ROLL
+
+
+def post_roll_ask(world, eid: int, key: str, label: str, auto: bool, context: dict, data: dict | None = None) -> bool:
+    """Offer ONE post-roll option ("add my inspiration die", "Cutting Words") to creature ``eid`` and return True when it
+    is taken.  Agents decide through the decision system (replayable); everybody else follows ``auto`` (the heuristic of
+    the caller) through the world's auto decider (``data['auto']`` marks the option scripted creatures take)."""
+    from emberdeep.core.decisions import DecisionOption, decide
+    d = dict(data or {})
+    d["auto"] = bool(auto)
+    ctx = dict(context)
+    ctx["post_roll"] = True
+    return decide(world, eid, post_roll_kind(), [DecisionOption(key, label, d)], ctx) > 0
 
 
 def ceil_half(x: int) -> int:
@@ -77,27 +94,6 @@ def choices_of(c) -> dict:
     """``CharacterBuild.choices`` of a PC (the factory attaches the build in ``make_pc``); empty for non-PCs."""
     b = getattr(c, "build", None)
     return b.choices if b is not None else {}
-
-
-def peek_rng(world):
-    """A copy of ``world.rng`` at its current state: draws made from it do not advance the real generator, so they
-    predict the dice the engine is about to roll."""
-    return copy.deepcopy(world.rng)
-
-
-class _PeekWorld:
-    __slots__ = ("rng",)
-
-    def __init__(self, rng):
-        self.rng = rng
-
-
-def peek_d20(world, adv: int, reroll_ones: bool = False):
-    """(kept roll, rng copy after the roll) of the next d20 roll with advantage state ``adv``."""
-    from emberdeep.core import resolution as R
-    g = peek_rng(world)
-    roll, _ = R._roll_d20(_PeekWorld(g), adv, reroll_ones)
-    return roll, g
 
 
 def last_event(world, etype, src: int = -1):

@@ -12,12 +12,13 @@ from emberdeep.core.decisions import DecisionOption
 from emberdeep.core.entities import S
 from emberdeep.core.events import EventType as ET
 from emberdeep.core.types import (
-    ActionCost, AreaShape, Condition, DamageType, DecisionKind, Relation, Size, SIZE_SQUARES, TargetType,
+    ActionCost, AreaShape, Condition, ControllerKind, DamageType, DecisionKind, GameMode, Relation, Size, SIZE_SQUARES, TargetType,
     WeaponProperty,
 )
 from emberdeep.data.schema import AreaSpec
 from emberdeep.rules.content import monster_util as U
-from emberdeep.rules.registry import Trait, register_trait, register_zone
+from emberdeep.rules.effects import Effect
+from emberdeep.rules.registry import Trait, register_effect, register_trait, register_zone
 from emberdeep.rules.zones import GenericZone
 
 
@@ -204,9 +205,11 @@ _FORM_TAGS = {
 class Shapechanger(Trait):
     """Polymorph as an action into the forms of ``trait_params['shapechanger']['forms']``.  The true form is 'humanoid' for
     lycanthropes, the monster's own id for imps / quasits, otherwise the amorphous form (mimic, doppelganger).  Per-form
-    ``ac`` / ``speed`` overrides apply.  Attacks restricted to some forms by their tags switch the form for free when used
-    (deviation: the rules charge an action) so no action is ever wasted."""
-    HOOKS = frozenset({"grant_abilities", "ac_base", "on_attack_declared"})
+    ``ac`` / ``speed`` overrides apply.  Attacks restricted to some forms (ability tags ``hybrid_only`` ...) are blocked
+    in the other forms (engine hook ``ability_blocked``) and changing form costs the action, as in the SRD.  Scripted
+    (non-agent) lycanthropes in their true form use the action of their first turn in combat to take the fighting form
+    (``on_turn_start``)."""
+    HOOKS = frozenset({"grant_abilities", "ac_base", "ability_blocked", "on_turn_start"})
 
     def _cfg(self, me):
         return U.tparam(me, "shapechanger", {}) or {}
@@ -268,23 +271,28 @@ class Shapechanger(Trait):
     def ac_base(self, world, me):
         return (self._cfg(me).get(self.current(me)) or {}).get("ac")
 
-    def on_attack_declared(self, world, ctx):
-        if ctx.attacker.eid != self.me:
-            return
-        me = ctx.attacker
-        ab = U.find_ability(world, me, ctx.ability_id)
-        if ab is None:
-            return
+    def ability_blocked(self, world, me, ab):
+        if me.eid != self.me:
+            return False
         allowed = None
         for t in ab.tags:
             if t in _FORM_TAGS:
                 allowed = _FORM_TAGS[t]
-        if allowed is None or self.current(me) in allowed:
+        return allowed is not None and self.current(me) not in allowed
+
+    def on_turn_start(self, world, me):
+        """Scripted lycanthropes shift into the form that can bite when a fight is on (this costs the action)."""
+        if me.eid != self.me or me.controller == ControllerKind.AGENT or world.mode != int(GameMode.COMBAT):
             return
-        for f in self.forms(me):
-            if f in allowed:
-                self.change(world, me, f)
-                return
+        if self.current(me) != self.true_form(me) or not U.able(me) or me.ts.action_used:
+            return
+        fighting = next((f for f in ("hybrid",) if f in self.forms(me)), None)
+        if fighting is None or self.true_form(me) != "humanoid":
+            return
+        if any(o.present and U.hostile_to(world, me, o) and world.sees(me.eid, o.eid) and world.distance(me.eid, o.eid) <= 12
+               for o in world.creatures):
+            me.ts.action_used = True
+            self.change(world, me, fighting)
 
 
 @register_trait("adhesive")
@@ -639,8 +647,39 @@ class GazeZone(_AuraZone):
             return
         dc = int(z.params.get("dc", 12))
         ab = U.ability_of(z.params.get("ability", "con"))
+        for e in list(c.effects):                                   # the previous turn's averted eyes lapse now
+            if e.ID == "averted_eyes":
+                EF.remove_effect(world, c, e, "new_turn")
+        if self._avert(world, z, c, s, dc, ab):
+            EF.add_effect(world, s, c, "averted_eyes", 2, {"gazer": s.eid}, expire="start_bearer")
+            return
         if not R.saving_throw(world, c, ab, dc, s.eid, name="petrifying_gaze"):
             EF.add_effect(world, s, c, "petrification", 2, {"dc": dc, "ability": "con", "second_save_dc": dc})
+
+
+@register_effect("averted_eyes")
+class AvertedEyes(Effect):
+    """The bearer looks away from a gazing monster until the start of its next turn: immune to the gaze, but the gazer is
+    unseen, so its attacks against it have disadvantage."""
+    HOOKS = frozenset({"attack_mods"})
+
+    def attack_mods(self, world, ctx):
+        if ctx.attacker.eid == self.me and ctx.target.eid == self.params.get("gazer"):
+            ctx.dis.append("averted_eyes")
+
+
+def _avert(self, world, z, c, s, dc, ab) -> bool:
+    """Start of the creature's turn: avert the eyes (a SPELL_CHOICE-style decision for agents) or look.  Scripted creatures
+    avert when the save is likely to fail (at least 40 %)."""
+    p_fail = (dc - R.save_bonus(c, ab) - 1) / 20.0
+    from emberdeep.core.decisions import DecisionOption, decide
+    from emberdeep.core.types import DecisionKind
+    opts = [DecisionOption("avert_eyes", "Avert eyes", {"auto": p_fail >= 0.4})]
+    return decide(world, c.eid, DecisionKind.SPELL_CHOICE, opts,
+                  {"spell": "petrifying_gaze", "choice": "avert_eyes", "post_roll": True, "gazer": s.eid}) > 0
+
+
+GazeZone._avert = _avert
 
 
 @register_trait("petrifying_gaze")

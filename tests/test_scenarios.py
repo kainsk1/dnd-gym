@@ -15,7 +15,7 @@ ALL = list_scenarios()
 def test_registry_contents():
     for sid in ("goblin_ambush", "goblin_ambush_small", "goblin_ambush_team", "dragon_hoard", "cursed_coffer",
                 "rival_delvers", "fountain_of_life", "shrine_of_wards", "hold_the_bridge", "gladiator_pit",
-                "caravan_escort", "deep_delve", "duel", "skirmish_2v2"):
+                "caravan_escort", "deep_delve", "duel", "skirmish_2v2", "mounted_patrol"):
         assert sid in ALL
     with pytest.raises(KeyError):
         get_scenario("nope")
@@ -52,7 +52,7 @@ def test_build(sid, seed):
     # objectives registered
     assert len(w.objectives) == len(spec.objectives)
     # markers resolved: creatures stand on walkable, distinct squares
-    cells = [(c.x, c.y) for c in w.creatures if c.present]
+    cells = [(c.x, c.y) for c in w.creatures if c.present and c.mount < 0]   # riders share their mount's square
     assert len(cells) == len(set(cells))
     assert info.comm_vocab == (spec.comm_vocab or DEFAULT_COMM_VOCAB) and len(info.comm_vocab) >= 1
     assert info.reward_spec is spec.rewards and info.player_factions

@@ -12,7 +12,7 @@ from emberdeep.core import resolution as R
 from emberdeep.core.abilities import FeatureAbility
 from emberdeep.core.entities import S
 from emberdeep.core.events import EventType as ET
-from emberdeep.core.types import Ability, ActionCost, Condition, DamageType, LightLevel, Skill, TargetType
+from emberdeep.core.types import Ability, ActionCost, Condition, DamageType, LightLevel, Relation, Skill, TargetType
 from emberdeep.rules.content import monster_util as U
 from emberdeep.rules.registry import Trait, register_trait
 
@@ -39,7 +39,6 @@ for _tid, _doc in (
         ("amorphous", "Can move through a space as narrow as 1 inch (squeezing is not modelled)."),
         ("siege_monster", "Double damage to objects and structures (doors use hit points via force_open only)."),
         ("web_sense", "Knows the location of creatures touching the same web (informational)."),
-        ("ooze_cube", "Engulf rules live in the 'engulf' special action."),
         ("aggressive", "Dash toward a hostile as a bonus action: see the 'aggressive' special action."),
         ("cunning_action", "Dash/Disengage/Hide as a bonus action: see the 'cunning_action' special action."),
         ("divine_eminence", "Bonus action smite: see the 'divine_eminence' special action."),
@@ -595,10 +594,46 @@ class Freeze(Trait):
             EF.add_effect(world, t, t, "speed_penalty", 2, {"feet": 20}, expire="end_bearer", silent=True)
 
 
+@register_trait("ooze_cube")
+class OozeCube(Trait):
+    """Gelatinous cube: while it uses Engulf (``state['engulfing']``) it may enter the spaces of Large-or-smaller creatures
+    (engine hook ``may_share_space``); the rules themselves live in the 'engulf' special action."""
+    HOOKS = frozenset({"may_share_space"})
+
+    def may_share_space(self, world, me, other):
+        return me.eid == self.me and bool(self.state.get("engulfing")) and int(other.size) <= 3
+
+
 @register_trait("fire_form")
 class FireForm(Trait):
-    """A creature that hits it with a melee attack while within 5 ft takes ``touch_damage`` fire damage."""
-    HOOKS = frozenset({"incoming_damage_mods"})
+    """A creature that touches the elemental or hits it with a melee attack while within 5 ft takes ``touch_damage`` fire
+    damage.  The elemental can enter a hostile creature's space and stop there (engine hooks ``may_share_space`` /
+    ``on_move``): the first time it enters a creature's space on a turn that creature takes the same damage and catches
+    fire (``burning``: the same fire damage at the start of each of its turns until it uses an action to douse the fire)."""
+    HOOKS = frozenset({"incoming_damage_mods", "may_share_space", "on_move", "on_turn_start"})
+
+    def may_share_space(self, world, me, other):
+        return me.eid == self.me
+
+    def on_turn_start(self, world, me):
+        self.state["entered"] = ()
+
+    def on_move(self, world, me, frm, to):
+        if me.eid != self.me:
+            return
+        entered = tuple(self.state.get("entered", ()))
+        for o in world.creatures:
+            if o is me or not o.present or o.status & S.DEAD or o.eid in entered or o.z != me.z:
+                continue
+            if not any(p in set(me.cells()) for p in o.cells()):
+                continue
+            self.state["entered"] = entered = entered + (o.eid,)
+            if world.relation(me.eid, o.eid) != Relation.HOSTILE:
+                continue
+            dice, dt = U.parse_dmg(str(self.params.get("touch_damage", "1d10 fire")), DamageType.FIRE)
+            U.deal(world, me, o, dice, dt, "fire_form")
+            if o.present and not o.status & S.DEAD:
+                EF.add_effect(world, me, o, "burning", -1, {"dice": dice, "end": "action_to_douse"})
 
     def incoming_damage_mods(self, world, dctx):
         a, ac = dctx.attacker, dctx.attack

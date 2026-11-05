@@ -268,23 +268,39 @@ def final_scores(build: CharacterBuild, race: RaceDef | None) -> list[int]:
 
 
 def make_pc(build: CharacterBuild, rng, hp_mode: str = "average") -> Creature:
-    """Build a Creature from a CharacterBuild (race, class, subclass, ASI, spells, equipment, resources)."""
+    """Build a Creature from a CharacterBuild (race, class(es), subclass, ASI, spells, equipment, resources).
+
+    Multiclass builds (``build.classes`` with several entries) follow SRD "Multiclassing": hit points per class hit
+    die, proficiency bonus by total level, features per class level, the combined Spellcaster slot table (Pact Magic
+    separate), per-class spells with each class's own casting ability, and the partial multiclass proficiencies."""
+    from emberdeep.data import classes as CL
     from emberdeep.rules.registry import warn_once as wo
     race = lookup_race(build.race)
-    cls = lookup_class(build.class_id)
-    if cls is None:
-        raise KeyError(f"unknown class '{build.class_id}'")
-    lvl = max(1, min(20, build.level))
+    entries = build.class_list()
+    cls_defs = []
+    for cid, _l, _s in entries:
+        cd = lookup_class(cid)
+        if cd is None:
+            raise KeyError(f"unknown class '{cid}'")
+        cls_defs.append(cd)
+    cls = cls_defs[0]
+    multi = len(entries) > 1
+    scores_final = final_scores(build, race)
+    if multi:
+        problems = CL.multiclass_problems(entries, scores_final)
+        if problems:
+            raise ValueError("illegal multiclass build '%s': %s" % (build.name, "; ".join(problems)))
+    lvl = max(1, min(20, sum(max(1, l) for _c, l, _s in entries)))
     c = Creature(build.name)
-    c.template_id = build.class_id
+    c.template_id = entries[0][0]
     c.build = build
     c.is_pc = True
     c.race = build.race
-    c.subclass = build.subclass
+    c.subclass = entries[0][2] or build.subclass
     c.level = lvl
-    c.class_levels = {build.class_id: lvl}
+    c.class_levels = {cid: max(1, l) for cid, l, _s in entries}
     c.prof = PROFICIENCY_BY_LEVEL[lvl]
-    c.scores = final_scores(build, race)
+    c.scores = scores_final
     c.mods = [ability_mod(s) for s in c.scores]
     if race is not None:
         c.size = race.size
@@ -294,21 +310,31 @@ def make_pc(build: CharacterBuild, rng, hp_mode: str = "average") -> Creature:
         c.resist = _mask(race.resistances)
     c.hit_die = cls.hit_die
     con = c.mods[2]
-    hp = cls.hit_die + con
-    for _ in range(2, lvl + 1):
+    hp = cls.hit_die + con                                   # first level of the first class: maximum die
+    hd_max: dict[int, int] = {}
+    dice_seq: list[int] = []
+    for i, (cd, (_cid, l, _s)) in enumerate(zip(cls_defs, entries)):
+        l = max(1, l)
+        hd_max[cd.hit_die] = hd_max.get(cd.hit_die, 0) + l
+        dice_seq += [cd.hit_die] * (l - 1 if i == 0 else l)
+    for die in dice_seq:
         if hp_mode == "roll":
-            hp += max(1, D.roll_die(rng, cls.hit_die) + con)
+            hp += max(1, D.roll_die(rng, die) + con)
         elif hp_mode == "max":
-            hp += cls.hit_die + con
+            hp += die + con
         else:
-            hp += max(1, cls.hit_die // 2 + 1 + con)
+            hp += max(1, die // 2 + 1 + con)
     hp = max(lvl, hp)
     extra_per_level = (race.hp_per_level if race is not None else 0)
-    # features
-    sub = lookup_subclass(build.subclass) if build.subclass else None
-    fids = _upto(cls.features_by_level, lvl)
-    if sub is not None:
-        fids += _upto(sub.features_by_level, lvl)
+    # features (per class level; a feature id shared by several classes - Extra Attack, ASI - is granted once, so it
+    # never stacks; Unarmored Defense variants are AC bases of which only the best applies)
+    fids: list[str] = []
+    for cd, (_cid, l, sub_id) in zip(cls_defs, entries):
+        l = max(1, l)
+        fids += _upto(cd.features_by_level, l)
+        sub = lookup_subclass(sub_id) if sub_id else None
+        if sub is not None:
+            fids += _upto(sub.features_by_level, l)
     if build.fighting_style and build.fighting_style not in fids:
         fids.append("style:" + build.fighting_style)
     seen = set()
@@ -329,6 +355,9 @@ def make_pc(build: CharacterBuild, rng, hp_mode: str = "average") -> Creature:
     c.feature_ids = tuple(seen)
     c.max_hp = c.hp = hp + extra_per_level * lvl
     c.hit_dice_max = c.hit_dice_left = lvl
+    if multi:
+        c.fstate["hd_max"] = dict(hd_max)
+        c.fstate["hd_left"] = dict(hd_max)
     # race traits
     if race is not None:
         for t in race.traits:
@@ -336,7 +365,7 @@ def make_pc(build: CharacterBuild, rng, hp_mode: str = "average") -> Creature:
             params = dict(tp) if isinstance(tp, dict) else {"value": tp}
             _add_hook(c, TRAITS, t, params, None, "trait")
         c.trait_ids = tuple(race.traits)
-    # proficiencies
+    # proficiencies: the first class grants its full list, later classes the multiclass subset
     for a in cls.saving_throws:
         c.save_profs |= 1 << int(a)
     for s in build.skills:
@@ -348,51 +377,82 @@ def make_pc(build: CharacterBuild, rng, hp_mode: str = "average") -> Creature:
         c.skill_prof[int(s)] = 2
     wp = set(cls.weapon_proficiencies)
     ap = {int(a) for a in cls.armor_proficiencies}
+    for cd in cls_defs[1:]:
+        arm, wpn, nsk = CL.MULTICLASS_PROFICIENCIES[cd.id]
+        ap |= {int(a) for a in arm}
+        wp |= set(wpn)
+        for s in (build.choices.get("mc_skills", {}) or {}).get(cd.id, ())[:nsk]:
+            c.skill_prof[int(s)] = max(c.skill_prof[int(s)], 1)
     if race is not None:
         wp |= set(race.weapon_proficiencies)
         ap |= {int(a) for a in race.armor_proficiencies}
     c.weapon_profs = frozenset(wp)
     c.armor_profs = frozenset(ap)
-    # resources
-    for rd in cls.resources:
-        if rd.ability_scaled is not None:
-            m = c.mods[int(rd.ability_scaled)]
-            mx = max(1, 1 + m) if rd.id == "divine_sense" else max(1, m)
-        else:
-            mx = rd.max_by_level[min(lvl, len(rd.max_by_level) - 1)] if rd.max_by_level else 0
-        c.resource_def[rd.id] = rd
-        c.resource_max[rd.id] = mx
-        c.resources[rd.id] = mx
+    # resources (same id in several classes - Channel Divinity - is one pool whose size is the sum of the grants)
+    for cd, (_cid, l, _s) in zip(cls_defs, entries):
+        l = max(1, min(20, l))
+        for rd in cd.resources:
+            if rd.ability_scaled is not None:
+                m = c.mods[int(rd.ability_scaled)]
+                mx = max(1, 1 + m) if rd.id == "divine_sense" else max(1, m)
+            else:
+                mx = rd.max_by_level[min(l, len(rd.max_by_level) - 1)] if rd.max_by_level else 0
+            if rd.id in c.resource_max:
+                mx += c.resource_max[rd.id]
+            c.resource_def.setdefault(rd.id, rd)
+            c.resource_max[rd.id] = mx
+            c.resources[rd.id] = mx
     # spellcasting
-    sc = cls.spellcasting
-    if sc is not None:
-        c.spell_ability = sc.ability
-        c.caster_level = lvl
-        if sc.kind == "pact":
-            n, plv = sc.pact_slots[lvl]
-            c.pact_slots = c.pact_max = n
-            c.pact_level = plv
-        else:
-            for i, n in enumerate(sc.slots[lvl][:9]):
-                c.spell_slots[i] = n
-                c.spell_slots_max[i] = n
-        spells = list(build.spells)
+    cls_spells = build.choices.get("class_spells", {}) or {}
+    cls_cants = build.choices.get("class_cantrips", {}) or {}
+    all_spells: list[str] = []
+    all_cantrips: list[str] = []
+    prepared: list[str] = []
+    abil_by_spell: dict[str, int] = {}
+    caster_entries = [(i, cd, e) for i, (cd, e) in enumerate(zip(cls_defs, entries)) if cd.spellcasting is not None]
+    for i, cd, (cid, l, sub_id) in caster_entries:
+        sc = cd.spellcasting
+        l = max(1, min(20, l))
+        if c.spell_ability is None:
+            c.spell_ability = sc.ability
+        sub = lookup_subclass(sub_id) if sub_id else None
+        spells = list(cls_spells.get(cid, build.spells if i == 0 else ()))
         if sub is not None:
             for k, ss in sorted(sub.bonus_spells.items()):
-                if k <= lvl:
-                    spells += [s for s in ss if s not in spells]
+                if k <= l:
+                    spells += [x for x in ss if x not in spells]
             land = str(build.choices.get("land", ""))
-            if land:
+            if land and sub.id == "land":
                 try:
                     from emberdeep.data.classes import LAND_CIRCLE_SPELLS
                     for k, ss in sorted(LAND_CIRCLE_SPELLS.get(land, {}).items()):
-                        if k <= lvl:
-                            spells += [s for s in ss if s not in spells]
+                        if k <= l:
+                            spells += [x for x in ss if x not in spells]
                 except Exception:  # noqa: BLE001
                     pass
-        c.spells = spells
-        c.prepared = list(spells)
-        cant = list(build.cantrips)
+        cant = list(cls_cants.get(cid, build.cantrips if i == 0 else ()))
+        for x in spells:
+            if x not in all_spells:
+                all_spells.append(x)
+                abil_by_spell.setdefault(x, int(sc.ability))
+            if x not in prepared:
+                prepared.append(x)
+        for x in cant:
+            if x not in all_cantrips:
+                all_cantrips.append(x)
+                abil_by_spell.setdefault(x, int(sc.ability))
+    if caster_entries:
+        slots, pact = CL.multiclass_slots(entries)
+        for i, n in enumerate(slots[:9]):
+            c.spell_slots[i] = n
+            c.spell_slots_max[i] = n
+        if pact[0]:
+            c.pact_slots = c.pact_max = pact[0]
+            c.pact_level = pact[1]
+        c.caster_level = (CL.multiclass_caster_level(entries) if multi else lvl) or lvl
+        c.spells = all_spells
+        c.prepared = prepared
+        cant = list(all_cantrips)
         rc = build.choices.get("racial_cantrip")
         if rc and rc not in cant:
             cant.append(rc)
@@ -401,6 +461,11 @@ def make_pc(build: CharacterBuild, rng, hp_mode: str = "average") -> Creature:
                 if s not in cant:
                     cant.append(s)
         c.cantrips = cant
+        if multi:
+            default = int(c.spell_ability)
+            diff = {k: v for k, v in abil_by_spell.items() if v != default}
+            if diff:
+                c.fstate["spell_abil"] = diff
     else:
         c.cantrips = list(build.cantrips) + ([build.choices["racial_cantrip"]] if build.choices.get("racial_cantrip")
                                               else [])

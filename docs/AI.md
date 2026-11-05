@@ -65,3 +65,11 @@ concentration `conc_hold*current value`. Movement gain = `S(best cell) - S(here)
 * Only helpless foes left: bots walk up and finish them (`finish_downed`).
 * Escorts (`vip` tag ally): never advance more than 8 squares ahead of the VIP, attackers within 4 squares of the VIP get a
   large target bonus, escorts vacate the goal area so the VIP can enter; the VIP retreats toward escorts when threatened.
+
+## v1.1 notes
+* Speed: per-act cost cut ~25% (0.92 -> ~0.70 ms mean CPU per act in a 4v6 fight, p99 ~3 ms): route cache (the rest of a
+  planned MOVE path is replayed without analysis), lazy `ability_mask`, cross-round estimate cache, world-shared offence
+  table, grid cache per turn, reuse of the previous survey for multi-attacks, survey skipped when the action is spent.
+* Stall fixes: VIPs never hunt; escorts wait instead of oscillating; relic scenarios (`relic_escape`) pick up the relic then
+  leave; heroes sweep unvisited blocks / `search` for hidden foes when a DEFEAT_ALL objective is open; locked doors are always
+  attempted (force); long fights stop kiting (`fatigue`); abilities `mount`/`dismount`/`mount_move` are role "util" (ignored).

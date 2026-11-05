@@ -142,7 +142,7 @@ class MetaOption(Feature):
         pass
 
     def on_cast(self, world, me, spell, slot):
-        if not self.armed(me) or spell.casting_time == ActionCost.REACTION or self.state.get("busy"):
+        if not self.armed(me) or spell.casting_time == ActionCost.REACTION or _meta_busy(me):
             return
         if not self.applies(world, me, spell, slot):
             return
@@ -154,6 +154,11 @@ class MetaOption(Feature):
         world.emit(ET.ABILITY_USE, me.eid, -1, cost, -1, {"ability": self.ID, "name": self.ID.replace("_", " ").title(),
                                                           "spell": spell.id, "vfx": "buff_generic"})
         self.apply(world, me, spell, slot)
+
+
+def _meta_busy(me) -> bool:
+    """A metamagic option is re-casting the spell for free (Twinned): the others must not trigger again."""
+    return any(h.state.get("busy") for h in R.hooks(me, "on_cast") if isinstance(h, MetaOption))
 
 
 def _cast_event(world, me):
@@ -225,24 +230,25 @@ class ExtendedSpell(MetaOption):
 
 @register_feature("quickened_spell")
 class QuickenedSpell(MetaOption):
-    """2 SP: cast a spell with a casting time of 1 action as a bonus action instead.  Arm it *before* you spend your
-    Action; the spell then uses your bonus action and the Action stays available (for a cantrip only, as the bonus
-    action spell rule dictates)."""
+    """2 SP: cast a spell with a casting time of 1 action as a bonus action instead.  Arm it any time the bonus action
+    is free (also after the Action was used); the next spell with a casting time of 1 action is then cast as a bonus
+    action (engine hook ``casting_time``), so the bonus-action spell rule applies: no other spell that turn except a
+    cantrip with a casting time of 1 action."""
     COST = 2
+    HOOKS = frozenset({"grant_abilities", "on_cast", "casting_time"})
 
     def arm_ok(self, world, actor):
         ts = actor.ts
-        return not ts.action_used and not ts.bonus_used and not ts.cast_action_spell
+        return not ts.bonus_used and not ts.cast_action_spell and not ts.cast_leveled_bonus_spell
 
     def applies(self, world, me, spell, slot):
         return spell.casting_time == ActionCost.ACTION
 
-    def apply(self, world, me, spell, slot):
-        ts = me.ts
-        ts.action_used = False
-        ts.cast_action_spell = False
-        ts.bonus_used = True
-        ts.cast_leveled_bonus_spell = True
+    def casting_time(self, world, caster, spell):
+        if caster.eid == self.me and self.armed(caster) and spell.casting_time == ActionCost.ACTION \
+                and sp_of(caster) >= self.COST:
+            return ActionCost.BONUS_ACTION
+        return None
 
 
 @register_feature("twinned_spell")
@@ -262,7 +268,10 @@ class TwinnedSpell(MetaOption):
                                      TargetType.ANY_CREATURE, TargetType.SELF_OR_ALLY))
 
     def applies(self, world, me, spell, slot):
-        return self.eligible(spell, slot) and sp_of(me) >= self.cost_for(spell)
+        if not (self.eligible(spell, slot) and sp_of(me) >= self.cost_for(spell)):
+            return False
+        ev = _cast_event(world, me)
+        return ev is not None and self._second(world, me, spell, ev.dst) is not None      # no second target: nothing is spent
 
     def _second(self, world, me, spell, first_eid):
         from emberdeep.rules import spells as SPL
@@ -349,20 +358,28 @@ class CarefulSpell(MetaOption):
 
 @register_feature("heightened_spell")
 class HeightenedSpell(MetaOption):
-    """3 SP: one target of the spell has disadvantage on its first saving throw against it."""
+    """3 SP: one target of the spell has disadvantage on the first saving throw it makes against it.  ``before_cast``
+    notes the spell that is about to be cast; ``force_save_mods`` imposes the disadvantage on the first hostile saver
+    of that casting, the points are paid when the spell is actually cast (``on_cast``; a countered spell costs nothing)."""
     COST = 3
-    HOOKS = frozenset({"grant_abilities", "on_cast", "force_save_mods"})
+    HOOKS = frozenset({"grant_abilities", "on_cast", "force_save_mods", "before_cast"})
 
     def applies(self, world, me, spell, slot):
         return spell.save is not None
 
-    def apply(self, world, me, spell, slot):
-        self.state["pending"] = True
+    def before_cast(self, world, caster, spell, ctx):
+        if caster.eid == self.me and self.armed(caster) and spell.save is not None and sp_of(caster) >= self.COST:
+            self.state["pending"] = spell.id
+
+    def on_cast(self, world, me, spell, slot):
+        MetaOption.on_cast(self, world, me, spell, slot)
+        self.state["pending"] = None
 
     def force_save_mods(self, world, ctx):
-        if self.state.get("pending") and ctx.is_spell and ctx.source == self.me \
+        if self.state.get("pending") and ctx.is_spell and ctx.source == self.me and ctx.spell is not None \
+                and ctx.spell.id == self.state["pending"] \
                 and world.relation(self.me, ctx.saver.eid) != Relation.ALLIED:
-            self.state["pending"] = False
+            self.state["pending"] = None
             ctx.dis.append("heightened_spell")
 
 

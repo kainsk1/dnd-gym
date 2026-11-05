@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import logging
 import math
+from functools import lru_cache
+from types import SimpleNamespace
 
 import numpy as np
 
 from emberdeep.core import dice as D
 from emberdeep.core import resolution as R
+from emberdeep.core.abilities import UNIVERSAL
 from emberdeep.core.entities import S
 from emberdeep.core.types import (
     ClassId, Condition, DecisionKind, EntityKind, GameMode, ObjectiveKind, Relation, Terrain, TargetType,
@@ -26,6 +29,7 @@ _COND_SHIFTS = np.arange(SP.N_COND, dtype=np.int64)
 _STATUS_SHIFTS = np.arange(SP.N_STATUS, dtype=np.int64)
 _HIDDEN_BIT = 3                      # Status.HIDDEN == 1 << 3
 _STATUS_BIT = {n: i for i, n in enumerate(SP.STATUS_NAMES)}
+_COMBAT = int(GameMode.COMBAT)
 # Relation enum value -> relation one-hot column (self, ally, neutral, truce, hostile)
 _REL_SLOT = np.array([4, 2, 3, 1], np.int8)
 _LOG_GOLD = math.log1p(2000.0)
@@ -43,6 +47,7 @@ def _gold_feat(g: float) -> float:
     return math.log1p(max(0.0, g)) / _LOG_GOLD
 
 
+@lru_cache(maxsize=4096)
 def _avg(expr: str) -> float:
     try:
         return float(D.average(expr))
@@ -85,14 +90,67 @@ class ObsBuilder:
         self._econsts = self._entity_consts()
         self._hp_mode = {"bucket": 0, "exact": 1, "hidden": 2}[cfg.enemy_hp]
         self._no_ack = np.zeros(64, bool)
+        self._ab_cache_ref: dict[int, tuple] = {}
+        self._map_stacks: dict = {}
+        self._ack_cache: dict = {}
+        self._Pent = np.zeros(13, np.int64)
+        self._need = np.zeros(max(1, cfg.max_entities), np.int64)
+        self._res = np.zeros(2, np.int64)
+        self._no_say = np.zeros((0, 3), np.int64)
+        self._say_items: list = []
+        self._say_arr = self._no_say
+        self._no_objf = np.zeros((0, 6), np.float32)
+        self._empty_bool = np.zeros(0, bool)
+        self._empty_i32 = np.zeros(0, np.int32)
+        self._dummy_cost = np.zeros((1, 1), np.float32)
+        self._social = 1 if cfg.social_features else 0
+        self._c_cover = self._ex["in_reach"] + 3
+        self._ul = self.fa.index["uses_left"]
+        self._avail = self.fa.index["available"]
+        M = SP.MAP_INDEX
+        self._ch_reach = M["reachable"]
+        self._win = np.zeros(6, np.int64)
+        self._ch_thr = M["threat"]
+        self._hbuf = np.zeros(max(1, cfg.max_entities), np.int64)
+        self._rbuf = np.zeros(max(1, cfg.max_entities), np.int64)
+        self._Pmap = np.array([0, 0, self.R, 0, 0, 0, 0, M["allies"], M["enemies"], M["neutrals"], M["objects"],
+                               M["threat"], M["visible"], M["explored"], M["light"], int(EntityKind.DOOR), 0], np.int64)
+        self._shared_ids = frozenset(id(a) for a in UNIVERSAL)
+        self._init_self()
 
     # ------------------------------------------------------------------------------------ per-episode
+    def _init_self(self) -> None:
+        """Index constants and the zero template of the self vector."""
+        ix, sl = self._ix, self._sl_self
+        names = ("hp_frac", "temp_hp", "hp_abs", "max_hp", "ac", "speed", "movement_left", "action_avail",
+                 "bonus_avail", "free_interaction_avail", "attacks_left", "reaction_avail", "pos_x", "pos_y",
+                 "altitude", "exhaustion", "concentrating", "pact_slots", "pact_level", "gold", "potions",
+                 "is_monster", "level", "mode_combat", "round", "is_decider", "rest_vote_self", "rest_vote_frac",
+                 "agent_index")
+        si = SimpleNamespace(**{n: ix[n] for n in names})
+        si.dss, si.dsf = ix["death_save_successes"], ix["death_save_failures"]
+        si.slots0, si.res0, si.class0 = sl["slots"].start, sl["res"].start, sl["class"].start
+        si.mod0, si.decision0, si.faction0 = sl["mod"].start, sl["decision"].start, sl["faction"].start
+        si.n_decision = len(SP.DECISION_NAMES)
+        si.truce_in, si.truce_out = ix["truce_offer_incoming"], ix["truce_offer_outgoing"]
+        si.res_other = si.res0 + SP.RESOURCE_IDS.index("other")
+        self._si = si
+        self._res_index = {rid: j for j, rid in enumerate(SP.RESOURCE_IDS)}
+        tmpl = np.zeros(len(self.fs), np.float32)
+        tmpl[sl["res"]] = -1.0
+        self._self_tmpl = tmpl
+        self._Pself = np.array([sl["cond"].start, SP.N_COND, sl["status"].start, SP.N_STATUS, ix["rest_vote_frac"]],
+                               np.int64)
+
     def reset(self) -> None:
         w = self.core.world
         st = w.map.static
         H, W = st.height, st.width
         self.H, self.W = H, W
         self._ab_cache.clear()
+        self._ab_cache_ref.clear()
+        self._map_stacks.clear()
+        self._ack_cache.clear()
         self._objective_cache.clear()
         self._zone_cache.clear()
         self._reach_cache.clear()
@@ -135,6 +193,15 @@ class ObsBuilder:
         return m
 
     # ------------------------------------------------------------------------------------ public
+    def build_ref(self, agent: str, ctx, frame) -> dict:
+        """Observation through the reference implementations only (differential tests, ``EMBERDEEP_OBS_REF=1``)."""
+        saved = K.REF
+        K.REF = True
+        try:
+            return self.build(agent, ctx, frame)
+        finally:
+            K.REF = saved
+
     def build(self, agent: str, ctx, frame) -> dict:
         core = self.core
         cfg = self.cfg
@@ -160,6 +227,106 @@ class ObsBuilder:
 
     # ------------------------------------------------------------------------------------ self
     def _self_vec(self, agent: str, ctx, frame) -> np.ndarray:
+        """Self vector; the bit blocks, rest-vote fraction and the final clip run in a Numba kernel."""
+        if K.REF or ctx.slot_rows[0] < 0:
+            return self._self_vec_ref(agent, ctx, frame)
+        core = self.core
+        w = core.world
+        c = w.entities[core.agent_eid[agent]]
+        i = self._si
+        out = self._self_tmpl.copy()
+        maxhp = float(max(1, c.max_hp))
+        out[i.hp_frac] = c.hp / maxhp
+        out[i.temp_hp] = min(2.0, c.temp_hp / maxhp)
+        out[i.hp_abs] = c.hp / 100.0
+        out[i.max_hp] = c.max_hp / 100.0
+        ac = c.ac_cache
+        out[i.ac] = (ac if ac is not None else R.compute_ac(w, c)) / 30.0
+        try:
+            speed = R.base_speed(w, c)
+        except Exception:  # noqa: BLE001
+            speed = c.speeds.get("walk", 30)
+        out[i.speed] = speed / 60.0
+        if w.active == c.eid and not w.done:
+            ts = c.ts
+            out[i.movement_left] = ts.movement_left / 60.0
+            out[i.action_avail] = 0.0 if ts.action_used else 1.0
+            out[i.bonus_avail] = 0.0 if ts.bonus_used else 1.0
+            out[i.free_interaction_avail] = 0.0 if ts.free_used else 1.0
+            out[i.attacks_left] = ts.attacks_left / 4.0
+        if c.reaction_available:
+            out[i.reaction_avail] = 1.0
+        out[i.pos_x] = c.x / max(1, self.W)
+        out[i.pos_y] = c.y / max(1, self.H)
+        out[i.altitude] = c.z / 12.0
+        out[i.exhaustion] = c.exhaustion / 6.0
+        if c.concentration is not None:
+            out[i.concentrating] = 1.0
+        out[i.dss] = c.death_succ / 3.0
+        out[i.dsf] = c.death_fail / 3.0
+        ss = c.spell_slots
+        if any(ss):
+            s0 = i.slots0
+            for n in range(9):
+                v = ss[n]
+                if v:
+                    out[s0 + n] = min(2.0, v / 4.0)
+        out[i.pact_slots] = c.pact_slots / 4.0
+        out[i.pact_level] = c.pact_level / 5.0
+        rmax = c.resource_max
+        if rmax:
+            r0 = i.res0
+            ridx = self._res_index
+            others = None
+            for rid, mx in rmax.items():
+                j = ridx.get(rid)
+                if j is not None:
+                    if mx and rid != "other":
+                        out[r0 + j] = c.resources.get(rid, 0) / max(1, mx)
+                else:
+                    if others is None:
+                        others = []
+                    others.append(rid)
+            if others is not None:
+                tot = sum(rmax[k] for k in others)
+                out[i.res_other] = sum(c.resources.get(k, 0) for k in others) / max(1, tot)
+        out[i.gold] = _gold_feat(c.gold)
+        inv = c.inventory
+        if inv:
+            out[i.potions] = sum(it.qty for it in inv if getattr(it.def_, "heal", None)) / 3.0
+        if c.is_pc and c.class_levels:
+            primary = max(c.class_levels.items(), key=lambda kv: kv[1])[0]
+            ci = _CLASS_INDEX.get(primary)
+            if ci is not None:
+                out[i.class0 + ci] = 1.0
+        else:
+            out[i.is_monster] = 1.0
+        out[i.level] = (c.level if c.is_pc else c.cr) / 10.0
+        m0 = i.mod0
+        out[m0:m0 + 6] = [m / 5.0 for m in c.mods[:6]]
+        if w.mode == _COMBAT:
+            out[i.mode_combat] = 1.0
+        out[i.round] = w.round / max(1, w.rules.max_rounds)
+        if ctx.is_decider:
+            out[i.is_decider] = 1.0
+        dk = 0
+        if ctx.decision is not None:
+            dk = int(ctx.decision.kind)
+        out[i.decision0 + min(dk, i.n_decision - 1)] = 1.0
+        if c.rest_vote:
+            out[i.rest_vote_self] = 1.0
+        f = c.faction
+        if f < SP.MAX_FACTIONS:
+            out[i.faction0 + f] = 1.0
+        if w.truce_offers:
+            nf = len(w.factions)
+            out[i.truce_in] = 1.0 if any(w.has_truce_offer(g, f) for g in range(nf) if g != f) else 0.0
+            out[i.truce_out] = 1.0 if any(w.has_truce_offer(f, g) for g in range(nf) if g != f) else 0.0
+        out[i.agent_index] = (core.agent_index[agent] + 1) / max(1, core.n_agents)
+        K.finish_self(out, frame.tab, frame.nc, int(ctx.slot_rows[0]), f, self._Pself)
+        return out.astype(self._fdt, copy=False)
+
+    def _self_vec_ref(self, agent: str, ctx, frame) -> np.ndarray:
         core = self.core
         w = core.world
         c = w.entities[core.agent_eid[agent]]
@@ -251,6 +418,13 @@ class ObsBuilder:
 
     # ------------------------------------------------------------------------------------ entities
     def _best_range(self, c, abil) -> int:
+        ent = self._ab_entry(c, abil)
+        v = ent[8]
+        if v is None:
+            v = ent[8] = self._best_range_ref(c, abil)
+        return v
+
+    def _best_range_ref(self, c, abil) -> int:
         hit = self._range_cache.get(c.eid)
         if hit is not None and hit[0] is abil:
             return hit[1]
@@ -319,7 +493,7 @@ class ObsBuilder:
     def _entity_consts(self):
         """Column / constant vectors handed to :func:`kernels.fill_entities` (built once)."""
         ex, exs = self._ex, self._exs
-        C = np.zeros(28, np.int64)
+        C = np.zeros(30, np.int64)
         C[K.C_KIND] = exs["kind"].start
         C[K.C_COND] = exs["cond"].start
         C[K.C_STATUS] = exs["status"].start
@@ -348,50 +522,82 @@ class ObsBuilder:
         C[K.C_SURR_BIT] = _STATUS_BIT["surrendered"]
         C[K.C_FLEE_BIT] = _STATUS_BIT["fleeing"]
         C[K.C_NFACTIONS] = SP.MAX_FACTIONS
+        C[K.C_OBJ] = ex["obj_open"]
+        C[K.C_SAID] = exs["said"].start if "said" in exs else 0
         return C
 
+    def _ack_lut(self, myf: int, ack) -> np.ndarray:
+        """Bool lookup table ``[eid] -> the faction has seen this creature's AC`` (cached while the set only grows)."""
+        if not ack:
+            return self._empty_bool
+        hit = self._ack_cache.get(myf)
+        if hit is not None and hit[0] is ack and hit[1] == len(ack):
+            return hit[2]
+        lut = np.zeros(max(len(self.core.world.entities), max(ack) + 1), bool)
+        lut[list(ack)] = True
+        self._ack_cache[myf] = (ack, len(ack), lut)
+        return lut
+
     def _entities(self, agent: str, ctx, frame):
+        """Entity feature matrix of one observer: one Numba kernel over the frame table (see ``_entities_ref``)."""
+        if K.REF:
+            return self._entities_ref(agent, ctx, frame)
         core = self.core
         w = core.world
         cfg = self.cfg
         E = cfg.max_entities
-        me = core.agent_eid[agent]
-        cme = w.entities[me]
         out = np.zeros((E, self._nfe), np.float32)
         mask = np.zeros(E, np.int8)
         ids = np.zeros(E, np.int32)
         k = ctx.n_slots
         if k == 0 or ctx.slot_rows[0] < 0:
             return out.astype(self._fdt, copy=False), mask, ids
+        me = core.agent_eid[agent]
+        cme = w.entities[me]
         r = ctx.slot_rows[:k]
-        eids_s = ctx.slot_eids[:k]
-        ex, exs = self._ex, self._exs
+        eids_s = ctx.slot_eids
         mask[:k] = 1
         myf = cme.faction
         history = core.history
-        known_ac = self._no_ack[:k] if len(self._no_ack) >= k else np.zeros(k, bool)
-        ack = history.ac_known.get(myf)
-        if ack:
-            known_ac = np.array([e in ack for e in eids_s.tolist()], bool)
-        abil = w.abilities(me)
-        mode = self._hp_mode
-        P = np.array([myf, len(w.factions), mode, core.n_agents, w.active, w.reach_of(cme),
-                      self._best_range(cme, abil), me, 1 if cfg.social_features else 0, frame.nc], np.int64)
-        need = np.zeros(k, np.int8)
-        K.fill_entities(out, need, r, ctx.visible_rows, frame.kind, frame.x, frame.y, frame.z, frame.size,
-                        frame.faction, frame.present, frame.hp, frame.max_hp, frame.ac, frame.cond, frame.status,
-                        frame.ctype, frame.size_enum, frame.level, frame.conc, frame.agent_idx, frame.initiative,
-                        frame.eid, frame.downed, frame.is_agent, w.relations, history.mat, known_ac, P,
-                        self._econsts, K.REL_SLOT)
-        nz = np.flatnonzero(need)
-        if nz.size:
-            c_cov = ex["in_reach"] + 3
-            for j in nz.tolist():
-                if need[j] == 1:
-                    out[j, c_cov] = int(w.cover(me, int(eids_s[j]))) * (1.0 / 3.0)
-                else:
-                    self._object_row(out[j], w.entities[int(eids_s[j])])
-                    np.clip(out[j], -SP.FEATURE_CLIP, SP.FEATURE_CLIP, out=out[j])
+        say = history.say
+        V = self.V
+        P = self._Pent
+        P[K.P_MYF] = myf
+        P[K.P_NFAC] = len(w.factions)
+        P[K.P_MODE] = self._hp_mode
+        P[K.P_NAGENTS] = core.n_agents
+        P[K.P_ACTIVE] = w.active
+        P[K.P_REACH] = w.reach_of(cme)
+        P[K.P_RANGE] = self._best_range(cme, w.abilities(me))
+        P[K.P_ME] = me
+        P[K.P_SOCIAL] = self._social
+        P[K.P_NC] = frame.nc
+        P[K.P_ROUND] = w.round
+        say_arr = self._no_say
+        sayv = 0
+        if V and say:
+            sayv = V
+            items = list(say.items())
+            if items == self._say_items:
+                say_arr = self._say_arr
+            else:
+                say_arr = np.array([(sp, tk, rd) for sp, (tk, rd) in items], np.int64)
+                self._say_items, self._say_arr = items, say_arr
+        P[K.P_SAYV] = sayv
+        fast_say = w.rules.say_radius is None
+        P[K.P_SAYFAST] = 1 if fast_say else 0
+        res = self._res
+        va = self._vocab_arr
+        K.fill_entities(out, self._need, res, r, ctx.visible_rows, frame.tab,
+                        frame.objf if frame.n > frame.nc else self._no_objf, w.relations, history.mat,
+                        self._ack_lut(myf, history.ac_known.get(myf)), say_arr,
+                        va if va is not None else self._empty_i32, ids, P, self._econsts, K.REL_SLOT)
+        nn = res[0]
+        if nn:
+            c_cov = self._c_cover
+            for j in self._need[:nn].tolist():
+                out[j, c_cov] = int(w.cover(me, int(eids_s[j]))) * (1.0 / 3.0)
+        ex, exs = self._ex, self._exs
         if w.truce_offers:
             kinds = frame.kind[r]
             fac = frame.faction[r].astype(np.int64)
@@ -401,13 +607,12 @@ class ObsBuilder:
                 f = int(fac[j])
                 out[j, ex["truce_offer_in"]] = 1.0 if w.has_truce_offer(f, myf) else 0.0
                 out[j, ex["truce_offer_out"]] = 1.0 if w.has_truce_offer(myf, f) else 0.0
-        say = history.say
-        if self.V and say:
+        if sayv and not fast_say:
             s0 = exs["said"].start
             for spk, (tok, rd) in say.items():
-                if not (0 <= tok < self.V):
+                if not (0 <= tok < V):
                     continue
-                js = np.flatnonzero(eids_s == spk)
+                js = np.flatnonzero(eids_s[:k] == spk)
                 if js.size == 0:
                     continue
                 j = int(js[0])
@@ -415,8 +620,8 @@ class ObsBuilder:
                     continue
                 if w.hears(cme, w.entities[int(spk)]):
                     out[j, s0 + tok] = 0.5 ** max(0, w.round - rd)
-        ids[:k] = self._vocab_ids(eids_s)
-        # the kernel already clipped, but the SAY decay and cover columns are inside the range by construction
+        if res[1]:
+            ids[:k] = self._vocab_ids(eids_s[:k])
         return out.astype(self._fdt, copy=False), mask, ids
 
     def _entities_ref(self, agent: str, ctx, frame):
@@ -467,7 +672,7 @@ class ObsBuilder:
         vis[0] = True
         flags = np.zeros((k, 4), np.float32)                                # in_reach, in_range, has_los, cover
         flags[:, 0] = dist <= w.reach_of(cme)
-        flags[:, 1] = dist <= self._best_range(cme, abil)
+        flags[:, 1] = dist <= self._best_range_ref(cme, abil)
         flags[:, 2] = vis
         for j in np.nonzero(vis & foe & (dist > 1))[0].tolist():
             flags[j, 3] = int(w.cover(me, int(eids_s[j]))) * (1.0 / 3.0)
@@ -675,14 +880,148 @@ class ObsBuilder:
             return -1.0
         return min(float(v), 25.0) / 5.0
 
+    def _uses_plan(self, abil, n: int) -> tuple:
+        """Static description of the ``uses_left`` column of the first ``n`` abilities (see ``_abilities``)."""
+        spells: list = []
+        items: list = []
+        other: dict = {}
+        for k in range(n):
+            ab = abil[k]
+            kind = ab.kind
+            if kind == "spell":
+                if ab.spell_level > 0:
+                    spells.append((k, ab.spell_level))
+            elif kind == "item":
+                items.append(k)
+            else:
+                other.setdefault(ab.id, []).append(k)
+        return tuple(spells), tuple(items), other
+
+    @staticmethod
+    def _ab_sig(ab) -> tuple:
+        """Everything about a non-shared ability that ``_ability_static`` reads (besides the creature numbers)."""
+        d = ab.data
+        it = d.get("item") if d else None
+        return (ab.id, ab.kind, int(ab.cost), int(ab.target), ab.range_sq, ab.long_range_sq, ab.reach_sq,
+                ab.spell_level, id(ab.source), ab.area, ab.tags, id(it),
+                (getattr(it, "bonus", 0), getattr(it, "penalty", 0)) if it is not None else None,
+                bool(d.get("thrown")) if d else False, bool(d.get("offhand")) if d else False)
+
+    def _ab_entry(self, c, abil) -> list:
+        """Cached static ability block of creature ``c`` for its current ability list ``abil``.
+
+        The engine rebuilds the list (new objects for weapons, spells ...) on every ``touch()``; the block is reused
+        when the creature numbers, the weapon-relevant equipment / hooks and every non-shared ability are
+        unchanged.  Entry: ``[abil, static, ids, version, plan, n, fingerprint, signatures, best_range]``."""
+        eid = c.eid
+        hit = self._ab_cache.get(eid)
+        if hit is not None and hit[0] is abil and hit[3] == c.version:
+            return hit
+        lay = self.core.layout
+        n = min(len(abil), lay.K)
+        cnum = (c.prof, tuple(c.mods), c.spell_ability, c.monster_spell_dc, c.monster_spell_atk)
+        eq = c.equipped
+        fp = (cnum, tuple(map(id, eq.values())), tuple(eq), frozenset(c.weapon_profs), tuple(h.ID for h in c.hooks),
+              tuple(map(id, R.hooks(c, "weapon_ability"))))
+        sig_of = self._ab_sig
+        shared = self._shared_ids
+        if hit is not None and hit[6] == fp and len(hit[0]) == len(abil):
+            old, sigs = hit[0], hit[7]
+            same = True
+            new_sigs = list(sigs)
+            for k in range(len(abil)):
+                ab = abil[k]
+                if ab is old[k]:
+                    continue
+                sg = sig_of(ab)
+                if sg != sigs[k]:
+                    same = False
+                    break
+                new_sigs[k] = sg
+            if same:
+                hit[0] = abil
+                hit[3] = c.version
+                hit[7] = new_sigs
+                return hit
+        static = np.zeros((lay.K, len(self.fa)), np.float32)
+        ids = np.zeros(lay.K, np.int32)
+        rc = self._row_cache
+        ability_id = self.vocab.ability_id
+        sigs = [None] * len(abil)
+        for k in range(n):
+            ab = abil[k]
+            if ab.kind == "weapon":                      # depends on the carried item / fighting styles
+                static[k] = self._ability_static(c, ab)
+            else:
+                key = (ab.id, ab.kind, int(ab.cost), int(ab.target), ab.range_sq, ab.long_range_sq, ab.reach_sq,
+                       ab.spell_level, id(ab.source), ab.area, ab.tags, cnum)
+                row = rc.get(key)
+                if row is None:
+                    row = rc[key] = self._ability_static(c, ab)
+                static[k] = row
+            ids[k] = ability_id(ab.id)
+        for k in range(len(abil)):
+            ab = abil[k]
+            if id(ab) not in shared:
+                sigs[k] = sig_of(ab)
+        static[:n, self._ul] = -1.0                       # "unlimited" unless the plan says otherwise
+        hit = [abil, static, ids, c.version, self._uses_plan(abil, n), n, fp, sigs, None]
+        self._ab_cache[eid] = hit
+        return hit
+
     def _abilities(self, agent: str, ctx):
+        if K.REF:
+            return self._abilities_ref(agent, ctx)
+        core = self.core
+        w = core.world
+        eid = core.agent_eid[agent]
+        c = w.entities[eid]
+        hit = self._ab_entry(c, w.abilities(eid))
+        static = hit[1].copy()
+        n = hit[5]
+        ul = self._ul
+        static[:n, self._avail] = ctx.ability_mask[:n]
+        spells, items, other = hit[4]
+        if spells:
+            sl = c.spell_slots
+            ps = c.pact_slots
+            pl = c.pact_level
+            suf: dict = {}
+            for k, lvl in spells:
+                t = suf.get(lvl)
+                if t is None:
+                    t = suf[lvl] = sum(sl[lvl - 1:]) + (ps if pl >= lvl else 0)
+                static[k, ul] = t / 5.0
+        if items:
+            abil = hit[0]
+            for k in items:
+                it = abil[k].data.get("item")
+                if it is not None:
+                    static[k, ul] = (it.charges if it.charges else it.qty) / 5.0
+        if other:
+            uld = c.uses_left
+            rsd = c.resources
+            if uld or rsd:
+                for key in (uld.keys() | rsd.keys()):
+                    ks = other.get(key)
+                    if ks is not None:
+                        v = uld.get(key)
+                        if v is None:
+                            v = rsd.get(key)
+                        if v is not None:
+                            val = min(float(v), 25.0) / 5.0
+                            for k in ks:
+                                static[k, ul] = val
+        return static.astype(self._fdt, copy=False), hit[2].copy()
+
+    def _abilities_ref(self, agent: str, ctx):
         core = self.core
         w = core.world
         lay = core.layout
         eid = core.agent_eid[agent]
         c = w.entities[eid]
         abil = w.abilities(eid)
-        hit = self._ab_cache.get(eid)
+        hit = self._ab_cache_ref.get(eid)
         if hit is None or hit[0] is not abil or hit[3] != c.version:
             n = min(len(abil), lay.K)
             static = np.zeros((lay.K, len(self.fa)), np.float32)
@@ -702,7 +1041,7 @@ class ObsBuilder:
                     static[k] = row
                 ids[k] = self.vocab.ability_id(ab.id)
             hit = (abil, static, ids, c.version)
-            self._ab_cache[eid] = hit
+            self._ab_cache_ref[eid] = hit
         static = hit[1].copy()
         ix = self.fa.index
         n = min(len(abil), lay.K)
@@ -730,7 +1069,90 @@ class ObsBuilder:
         return out.astype(self._fdt, copy=False)
 
     # ------------------------------------------------------------------------------------ map
+    def _explore(self, agent: str) -> np.ndarray:
+        """``core.update_explored`` in one Numba pass."""
+        core = self.core
+        ex = core.explored[agent]
+        if core.is_live(agent):
+            new = K.explore_update(ex, core.visible_for(agent))
+            if new:
+                core.explore_gain[agent] += new
+        return ex
+
+    def _map_stack(self, faction: int, m):
+        """Static + door / opacity channels as one ``[10, H, W]`` float32 block (cached per opacity / move version)."""
+        key = (m.opaque_version, m.move_version)
+        hit = self._map_stacks.get(faction)
+        if hit is None or hit[0] != key:
+            M, st = SP.MAP_INDEX, self._static
+            names = ["in_bounds", "difficult", "hazard", "water", "pit", "cover", "objective", "opaque", "door_closed",
+                     "door_open"]
+            dc = m.door_closed
+            arrs = [np.ones((self.H, self.W), np.float32), st["difficult"], st["hazard"], st["water"], st["pit"],
+                    st["cover"], self.objective_mask(faction), m.opaque, dc, st["door_any"] & ~dc]
+            hit = (key, np.ascontiguousarray(np.stack(arrs).astype(np.float32)),
+                   np.array([M[n] for n in names], np.int64))
+            self._map_stacks[faction] = hit
+        return hit[1], hit[2]
+
     def _map(self, agent: str, ctx, frame) -> np.ndarray:
+        if K.REF or self.cfg.fog_of_war_map:
+            return self._map_ref(agent, ctx, frame)
+        core = self.core
+        w = core.world
+        R, W2 = self.R, self.W2
+        eid = core.agent_eid[agent]
+        c = w.entities[eid]
+        H, Wd = self.H, self.W
+        out = np.zeros((SP.N_MAP_CHANNELS, W2, W2), np.float32)
+        cx, cy = c.x, c.y
+        x0, y0 = cx - R, cy - R
+        sx0, sy0 = max(0, x0), max(0, y0)
+        sx1, sy1 = min(Wd, cx + R + 1), min(H, cy + R + 1)
+        if sx1 <= sx0 or sy1 <= sy0:
+            return self._finish_map(out)
+        stack, chans = self._map_stack(c.faction, w.map)
+        P = self._Pmap
+        P[0] = cx
+        P[1] = cy
+        P[3] = H
+        P[4] = Wd
+        P[5] = c.faction
+        P[6] = len(w.factions)
+        P[16] = 1 if core.is_live(agent) else 0
+        res = self._res
+        explored = core.explored[agent]
+        K.fill_map(out, stack, chans, core.visible_for(agent), explored, w.light_grid(), frame.tab, ctx.slot_rows,
+                   ctx.visible_rows, w.relations, P, self._hbuf, res)
+        if res[1]:
+            core.explore_gain[agent] += int(res[1])
+        nh = res[0]
+        if nh:
+            rows_h = self._hbuf[:nh]
+            reach_of = w.reach_of
+            ents = frame.ents
+            rch = self._rbuf
+            for i, r in enumerate(rows_h.tolist()):
+                rch[i] = reach_of(ents[r])
+            K.mark_threat(out, self._ch_thr, frame.tab, rows_h, rch, x0, y0, W2)
+        zones = w.zones
+        if zones:
+            M = SP.MAP_INDEX
+            zh, zb = M["zone_harmful"], M["zone_helpful"]
+            for z in zones:
+                arr = self._zone_cells(z)
+                if arr.size == 0:
+                    continue
+                rx = arr[:, 0] - x0
+                ry = arr[:, 1] - y0
+                ok = (rx >= 0) & (rx < W2) & (ry >= 0) & (ry < W2)
+                if ok.any():
+                    out[zh if z.harmful else zb, ry[ok], rx[ok]] = 1.0
+        if ctx.is_decider and ctx.decision is None:
+            self._reachable(out, c, frame, x0, y0, self._ch_reach)
+        return self._finish_map(out)
+
+    def _map_ref(self, agent: str, ctx, frame) -> np.ndarray:
         core = self.core
         w = core.world
         cfg = self.cfg
@@ -826,7 +1248,7 @@ class ObsBuilder:
                 out[zh if z.harmful else zb, ry[ok], rx[ok]] = 1.0
         # --- reachable cells (decider only)
         if ctx.is_decider and ctx.decision is None:
-            self._reachable(out, c, frame, x0, y0, M["reachable"])
+            self._reachable_ref(out, c, frame, x0, y0, M["reachable"])
         return self._finish_map(out)
 
     def _static_stack(self, faction: int):
@@ -871,6 +1293,35 @@ class ObsBuilder:
         return arr
 
     def _reachable(self, out, c, frame, x0, y0, ch) -> None:
+        w = self.core.world
+        ml = c.ts.movement_left
+        if ml < 5:
+            return
+        m = w.map
+        mode = "fly" if c.z > 0 else ("swim" if c.speeds.get("swim") else "walk")
+        grid = m.cost_grid(mode, c.size_sq)
+        rule = 1 if w.rules.diagonal_rule == "5-10-5" else 0
+        fld = getattr(w, "_ap_field", None)
+        use = fld is not None and fld[0] == c.eid and fld[1] == c.x and fld[2] == c.y and fld[3] == rule
+        cost32 = np.empty(grid.shape, np.float32)
+        R = self.R
+        win = self._win
+        win[0], win[1] = max(0, x0), max(0, y0)
+        win[2], win[3] = min(self.W, c.x + R + 1), min(self.H, c.y + R + 1)
+        win[4], win[5] = x0, y0
+        same = K.reach_cost(grid, frame.tab, frame.nc, c.faction, c.size_sq, c.z, w.relations, cost32,
+                            fld[4] if use else self._dummy_cost, use, fld[5] if use else self._dummy_cost, out, ch,
+                            float(ml), win)
+        if not same:
+            try:
+                from emberdeep.core import _geom_fallback as GF
+                dist = GF.geo.dijkstra(cost32, c.x, c.y, float(ml), rule)
+            except Exception:  # noqa: BLE001
+                log.debug("dijkstra failed", exc_info=True)
+                return
+            K.write_reach(out, ch, dist, float(ml), win[0], win[1], win[2], win[3], x0, y0)
+
+    def _reachable_ref(self, out, c, frame, x0, y0, ch) -> None:
         w = self.core.world
         ts = c.ts
         ml = ts.movement_left
